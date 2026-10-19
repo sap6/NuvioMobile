@@ -92,6 +92,7 @@ data class PlayerSettingsUiState(
     val nextEpisodeThresholdMinutesBeforeEnd: Float = 2f,
     val preloadNextEpisodeSources: Boolean = false,
     val useLibass: Boolean = false,
+    val pauseOtherAudio: Boolean = true,
     val libassRenderType: String = "CUES",
     val iosVideoOutputPreset: IosVideoOutputPreset = IosVideoOutputPreset.NativeEdr,
     val iosToneMappingMode: IosToneMappingMode = IosToneMappingMode.Auto,
@@ -174,6 +175,7 @@ object PlayerSettingsRepository {
     private var nextEpisodeThresholdMinutesBeforeEnd = 2f
     private var preloadNextEpisodeSources = false
     private var useLibass = false
+    private var pauseOtherAudio = true
     private var libassRenderType = "CUES"
     private var iosVideoOutputPreset = IosVideoOutputPreset.NativeEdr
     private var iosToneMappingMode = IosToneMappingMode.Auto
@@ -262,6 +264,7 @@ object PlayerSettingsRepository {
         nextEpisodeThresholdMinutesBeforeEnd = 2f
         preloadNextEpisodeSources = false
         useLibass = false
+        pauseOtherAudio = true
         libassRenderType = "CUES"
         iosVideoOutputPreset = IosVideoOutputPreset.NativeEdr
         iosToneMappingMode = IosToneMappingMode.Auto
@@ -416,6 +419,7 @@ object PlayerSettingsRepository {
         nextEpisodeThresholdMinutesBeforeEnd = PlayerSettingsStorage.loadNextEpisodeThresholdMinutesBeforeEnd() ?: 2f
         preloadNextEpisodeSources = PlayerSettingsStorage.loadPreloadNextEpisodeSources() ?: false
         useLibass = PlayerSettingsStorage.loadUseLibass() ?: false
+        pauseOtherAudio = PlayerSettingsStorage.loadPauseOtherAudio() ?: true
         libassRenderType = PlayerSettingsStorage.loadLibassRenderType() ?: "CUES"
         iosVideoOutputPreset = PlayerSettingsStorage.loadIosVideoOutputPreset()
             ?.let { runCatching { IosVideoOutputPreset.valueOf(it) }.getOrNull() }
@@ -980,6 +984,14 @@ object PlayerSettingsRepository {
         PlayerSettingsStorage.saveUseLibass(enabled)
     }
 
+    fun setPauseOtherAudio(enabled: Boolean) {
+        ensureLoaded()
+        if (pauseOtherAudio == enabled) return
+        pauseOtherAudio = enabled
+        publish()
+        PlayerSettingsStorage.savePauseOtherAudio(enabled)
+    }
+
     fun setLibassRenderType(renderType: String) {
         ensureLoaded()
         if (libassRenderType == renderType) return
@@ -1214,6 +1226,7 @@ object PlayerSettingsRepository {
             nextEpisodeThresholdMinutesBeforeEnd = nextEpisodeThresholdMinutesBeforeEnd,
             preloadNextEpisodeSources = preloadNextEpisodeSources,
             useLibass = useLibass,
+            pauseOtherAudio = pauseOtherAudio,
             libassRenderType = libassRenderType,
             iosVideoOutputPreset = iosVideoOutputPreset,
             iosToneMappingMode = iosToneMappingMode,

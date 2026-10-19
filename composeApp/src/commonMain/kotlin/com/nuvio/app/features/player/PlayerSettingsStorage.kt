@@ -150,6 +150,8 @@ internal expect object PlayerSettingsStorage {
     fun savePreloadNextEpisodeSources(enabled: Boolean)
     fun loadUseLibass(): Boolean?
     fun saveUseLibass(enabled: Boolean)
+    fun loadPauseOtherAudio(): Boolean?
+    fun savePauseOtherAudio(enabled: Boolean)
     fun loadLibassRenderType(): String?
     fun saveLibassRenderType(renderType: String)
     fun loadIosVideoOutputPreset(): String?

@@ -2395,6 +2395,8 @@
     <string name="layout_ratings_hide_unwatched">Hide Unwatched</string>
     <string name="settings_playback_legacy_layout">Legacy layout</string>
     <string name="settings_playback_legacy_layout_description">Use the original player controls.</string>
+    <string name="settings_playback_pause_other_audio">Pause other audio</string>
+    <string name="settings_playback_pause_other_audio_description">Pause music and other apps when playback starts. Turn off to keep watching during calls.</string>
     <string name="compose_player_via">Via %1$s</string>
     <string name="compose_player_episode_code">S%1$d E%2$d</string>
     <string name="compose_player_more_actions">More controls</string>

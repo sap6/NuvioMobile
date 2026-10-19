@@ -500,6 +500,17 @@ private fun PlaybackSettingsSection(
                         onClick = { showHoldToSpeedValueDialog = true },
                     )
                 }
+                if (!isIos) {
+                    SettingsGroupDivider(isTablet = isTablet)
+                    SettingsSwitchRow(
+                        title = stringResource(Res.string.settings_playback_pause_other_audio),
+                        description = stringResource(Res.string.settings_playback_pause_other_audio_description),
+                        checked = autoPlayPlayerSettings.pauseOtherAudio,
+                        enabled = !autoPlayPlayerSettings.externalPlayerEnabled,
+                        isTablet = isTablet,
+                        onCheckedChange = PlayerSettingsRepository::setPauseOtherAudio,
+                    )
+                }
             }
         }
 

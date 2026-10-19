@@ -974,6 +974,10 @@ actual object PlayerSettingsStorage {
 
     actual fun saveUseLibass(enabled: Boolean) {}
 
+    actual fun loadPauseOtherAudio(): Boolean? = null
+
+    actual fun savePauseOtherAudio(enabled: Boolean) {}
+
     actual fun loadLibassRenderType(): String? = null
 
     actual fun saveLibassRenderType(renderType: String) {}

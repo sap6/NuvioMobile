@@ -597,6 +597,11 @@ internal fun settingsSearchEntries(
                 stringResource(Res.string.settings_playback_touch_gestures_description),
             ),
             PlaybackSearchRow("hold-speed", stringResource(Res.string.settings_playback_hold_speed)),
+            if (!isIos) PlaybackSearchRow(
+                "pause-other-audio",
+                stringResource(Res.string.settings_playback_pause_other_audio),
+                stringResource(Res.string.settings_playback_pause_other_audio_description),
+            ) else null,
         ),
     )
     addPlaybackRows(

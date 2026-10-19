@@ -185,6 +185,7 @@ actual fun PlatformPlayerSurface(
                 videoOutput = playerSettings.androidLibmpvVideoOutput,
                 hardwareDecodingEnabled = playerSettings.androidLibmpvHardwareDecodingEnabled,
                 yuv420pEnabled = playerSettings.androidLibmpvYuv420pEnabled,
+                pauseOtherAudio = playerSettings.pauseOtherAudio,
                 onControllerReady = onControllerReady,
                 onSnapshot = onSnapshot,
                 onError = onError,
@@ -440,7 +441,7 @@ private fun ExoPlayerSurface(
         )
 
         val playerBuilder = ExoPlayer.Builder(context)
-            .setAudioAttributes(playbackAudioAttributes, true)
+            .setAudioAttributes(playbackAudioAttributes, playerSettings.pauseOtherAudio)
             .setTrackSelector(trackSelector)
             .setLoadControl(loadControl)
 
@@ -1080,6 +1081,7 @@ private fun LibmpvPlayerSurface(
     videoOutput: AndroidLibmpvVideoOutput,
     hardwareDecodingEnabled: Boolean,
     yuv420pEnabled: Boolean,
+    pauseOtherAudio: Boolean,
     onControllerReady: (PlayerEngineController) -> Unit,
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
@@ -1173,7 +1175,7 @@ private fun LibmpvPlayerSurface(
                             "elapsedMs=${diagnosticElapsedSince(playbackDiagnostics.prepareStartedAtMs)}",
                     )
                 }
-                if (property == "pause" && !value) {
+                if (property == "pause" && !value && pauseOtherAudio) {
                     coroutineScope.launch(Dispatchers.Main.immediate) { audioFocus.request() }
                 }
                 if (property == "eof-reached" || property == "pause" || property == "paused-for-cache" || property == "seeking") {
