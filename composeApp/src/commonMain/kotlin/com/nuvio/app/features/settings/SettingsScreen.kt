@@ -780,6 +780,9 @@ private fun MobileSettingsScreen(
                     mdbListConnected = mdbListConnected,
                     onCommentsEnabledChange = TraktCommentsSettings::setEnabled,
                 )
+                SettingsPage.Cast -> castSettingsContent(
+                    isTablet = false,
+                )
             }
         }
     }
@@ -1180,6 +1183,9 @@ private fun TabletSettingsScreen(
                         commentsEnabled = traktCommentsEnabled,
                         mdbListConnected = mdbListConnected,
                         onCommentsEnabledChange = TraktCommentsSettings::setEnabled,
+                    )
+                    SettingsPage.Cast -> castSettingsContent(
+                        isTablet = true,
                     )
                 }
             }

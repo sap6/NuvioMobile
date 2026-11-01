@@ -5,6 +5,7 @@ import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Dns
@@ -226,6 +227,11 @@ internal enum class SettingsPage(
         category = SettingsCategory.Services,
         parentPage = Root,
     ),
+    Cast(
+        titleRes = Res.string.compose_settings_page_cast,
+        category = SettingsCategory.Watch,
+        parentPage = Root,
+    ),
 }
 
 internal val SettingsPage.opensInlineOnTablet: Boolean
@@ -277,4 +283,5 @@ internal val SettingsPage.icon: ImageVector
         SettingsPage.PlaybackVideo -> Icons.Default.VideoSettings
         SettingsPage.PlaybackBuffer -> Icons.Default.NetworkCheck
         SettingsPage.PlaybackP2p -> Icons.Default.Hub
+        SettingsPage.Cast -> Icons.Default.Cast
     }
