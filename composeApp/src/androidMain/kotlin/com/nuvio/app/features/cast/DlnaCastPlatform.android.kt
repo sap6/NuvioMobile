@@ -4,15 +4,21 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
 import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.InetAddress
-import java.net.MulticastSocket
 import java.net.NetworkInterface
+import java.net.SocketTimeoutException
+import java.net.URI
 import java.net.URL
 import java.util.concurrent.TimeUnit
 
@@ -20,26 +26,54 @@ internal actual object DlnaCastPlatform {
     private const val TAG = "DlnaCastPlatform"
     private const val SSDP_ADDRESS = "239.255.255.250"
     private const val SSDP_PORT = 1900
-    private const val SSDP_MX = 3
+    private const val SSDP_MX = 2
+
+    private val SEARCH_TYPES = listOf(
+        "urn:schemas-upnp-org:device:MediaRenderer:1",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "ssdp:all",
+    )
 
     private var appContext: Context? = null
 
-    private val httpClient: OkHttpClient by lazy {
+    /** The home network found by the last search; TV commands and the relay go over it. */
+    @Volatile private var localNetwork: CastLocalNetwork? = null
+
+    /** Talks to TVs over Wi-Fi directly, so a VPN on the phone can't swallow the commands. */
+    @Volatile private var httpClient: OkHttpClient = CastLocalNetwork.baseClient
+
+    /** Fetches what the relay passes on, the same way the phone's own player does (including through a VPN). */
+    private val relayClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(5, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
             .build()
     }
+
+    private var relay: CastRelay? = null
 
     fun initialize(context: Context) {
         appContext = context.applicationContext
     }
 
+    private fun refreshLocalNetwork(): CastLocalNetwork? {
+        val context = appContext ?: return null
+        return CastLocalNetwork.find(context).also {
+            localNetwork = it
+            httpClient = it?.httpClient(CastLocalNetwork.baseClient) ?: CastLocalNetwork.baseClient
+        }
+    }
+
+    /**
+     * Finds TVs with SSDP: a search to the UPnP multicast address, sent over Wi-Fi even when a VPN is
+     * on, and the same search sent straight to every address on the home network, for VPNs and routers
+     * that don't pass multicast. Each device that answers is asked for its description.
+     */
     actual suspend fun scanDevices(timeoutMs: Int): DlnaScanResult = withContext(Dispatchers.IO) {
-        val locations = mutableSetOf<String>()
         var multicastLock: WifiManager.MulticastLock? = null
-        var socket: MulticastSocket? = null
         try {
+            val network = refreshLocalNetwork()
+                ?: return@withContext DlnaScanResult.Failure("Connect to Wi-Fi to find TVs.")
             try {
                 val wifi = appContext?.applicationContext?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
                 multicastLock = wifi?.createMulticastLock("nuvio_dlna_scan")
@@ -49,183 +83,241 @@ internal actual object DlnaCastPlatform {
                 Log.w(TAG, "MulticastLock acquire failed: ${e.message}")
             }
 
-            socket = MulticastSocket(null).apply {
-                reuseAddress = true
-                soTimeout = timeoutMs
-                timeToLive = 2
-            }
-            socket.bind(java.net.InetSocketAddress(0))
-
-            val stTargets = listOf(
-                "urn:schemas-upnp-org:device:MediaRenderer:1",
-                "urn:schemas-upnp-org:service:AVTransport:1",
-                "ssdp:all"
-            )
-
-            val group = InetAddress.getByName(SSDP_ADDRESS)
-            for (st in stTargets) {
-                val msg = buildString {
-                    append("M-SEARCH * HTTP/1.1\r\n")
-                    append("HOST: $SSDP_ADDRESS:$SSDP_PORT\r\n")
-                    append("MAN: \"ssdp:discover\"\r\n")
-                    append("MX: $SSDP_MX\r\n")
-                    append("ST: $st\r\n")
-                    append("\r\n")
+            val locations = LinkedHashSet<String>()
+            DatagramSocket().use { socket ->
+                // If the socket can't be tied to Wi-Fi, the normal route may still reach the TV.
+                runCatching { network.bind(socket) }
+                var sent = 0
+                fun trySend(st: String, address: InetAddress) {
+                    val bytes = searchMessage(st, address.hostAddress ?: SSDP_ADDRESS)
+                    if (runCatching { socket.send(DatagramPacket(bytes, bytes.size, address, SSDP_PORT)) }.isSuccess) sent++
                 }
-                val bytes = msg.toByteArray(Charsets.UTF_8)
-                val packet = DatagramPacket(bytes, bytes.size, group, SSDP_PORT)
-                try {
-                    socket.send(packet)
-                    Log.d(TAG, "Sent M-SEARCH ST=$st")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Send failed ST=$st: ${e.message}")
+                val group = InetAddress.getByName(SSDP_ADDRESS)
+                // UDP can drop packets, so search twice; some TVs only answer searches for their device type.
+                repeat(2) { for (st in SEARCH_TYPES) trySend(st, group) }
+                network.neighbours().chunked(32).forEach { batch ->
+                    for (address in batch) {
+                        trySend(SEARCH_TYPES[0], address)
+                        trySend(SEARCH_TYPES[1], address)
+                    }
+                    // A short pause between batches keeps the phone's Wi-Fi from dropping a burst.
+                    Thread.sleep(5)
                 }
-                try { Thread.sleep(150) } catch (_: Exception) {}
-            }
+                Log.i(TAG, "Sent $sent searches (Wi-Fi bound: ${network.canBind}, own address ${network.ownAddress?.hostAddress})")
+                if (sent == 0) {
+                    return@withContext DlnaScanResult.Failure(blockedReason())
+                }
 
-            val buffer = ByteArray(8192)
-            val deadline = System.currentTimeMillis() + timeoutMs
-            while (System.currentTimeMillis() < deadline) {
-                val remaining = (deadline - System.currentTimeMillis()).toInt().coerceAtLeast(100)
-                socket.soTimeout = remaining.coerceAtMost(1000)
-                val packet = DatagramPacket(buffer, buffer.size)
-                try {
-                    socket.receive(packet)
-                } catch (e: java.net.SocketTimeoutException) {
-                    continue
-                } catch (e: Exception) {
-                    Log.w(TAG, "Receive error: ${e.message}")
-                    break
-                }
-                val response = String(packet.data, 0, packet.length, Charsets.UTF_8)
-                val location = parseLocationHeader(response)
-                if (location != null && location.isNotBlank()) {
-                    val normalized = location.trim()
-                    if (normalized.startsWith("http", ignoreCase = true)) {
-                        if (locations.add(normalized)) {
-                            Log.i(TAG, "Discovered LOCATION: $normalized")
-                        }
+                val buffer = ByteArray(8192)
+                val deadline = System.currentTimeMillis() + timeoutMs
+                // Short waits, so the search ends on time.
+                socket.soTimeout = 250
+                while (System.currentTimeMillis() < deadline) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    try {
+                        socket.receive(packet)
+                    } catch (_: SocketTimeoutException) {
+                        continue
+                    }
+                    val location = parseLocationHeader(String(packet.data, 0, packet.length, Charsets.UTF_8))?.trim()
+                    if (location != null && location.startsWith("http", ignoreCase = true) && locations.add(location)) {
+                        Log.i(TAG, "Discovered LOCATION: $location from ${packet.address.hostAddress}")
                     }
                 }
             }
-
             Log.i(TAG, "SSDP discovery finished, found ${locations.size} locations")
 
-            if (locations.isEmpty()) {
-                return@withContext DlnaScanResult.Success(emptyList())
+            // Fetch descriptions side by side, so a slow device doesn't hold up the others.
+            val devices = coroutineScope {
+                locations.map { location -> async { describe(location) } }.awaitAll().filterNotNull()
             }
-
-            val client = httpClient
-
-            val devices = mutableListOf<DlnaDevice>()
-            for (location in locations) {
-                try {
-                    val req = Request.Builder().url(location).get().build()
-                    val resp = client.newCall(req).execute()
-                    if (!resp.isSuccessful) {
-                        Log.w(TAG, "GET $location failed ${resp.code}")
-                        continue
-                    }
-                    val xml = resp.body?.string() ?: continue
-                    val parsed = DlnaSoap.parseDeviceDescription(xml, location) ?: run {
-                        Log.w(TAG, "Parse failed for $location")
-                        continue
-                    }
-                    val ip = try { URL(location).host } catch (_: Exception) { null }
-                    val device = DlnaDevice(
-                        id = parsed.udn,
-                        friendlyName = parsed.friendlyName,
-                        modelName = parsed.modelName,
-                        manufacturer = parsed.manufacturer,
-                        locationUrl = location,
-                        controlUrl = parsed.controlUrl,
-                        eventSubUrl = parsed.eventSubUrl,
-                        avTransportServiceType = parsed.serviceType,
-                        ipAddress = ip,
-                        renderingControlUrl = parsed.renderingControlUrl,
-                    )
-                    devices.add(device)
-                    Log.i(TAG, "Parsed device: ${device.friendlyName} control=${device.controlUrl}")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error fetching $location: ${e.message}")
-                }
-            }
-
-            val distinct = devices.distinctBy { it.id }
-            DlnaScanResult.Success(distinct)
+            DlnaScanResult.Success(devices.distinctBy { it.id })
         } catch (e: Exception) {
             Log.e(TAG, "scanDevices error", e)
             DlnaScanResult.Failure(e.message ?: "Scan error")
         } finally {
-            try { socket?.close() } catch (_: Exception) {}
             try { multicastLock?.release() } catch (_: Exception) {}
         }
+    }
+
+    private fun searchMessage(st: String, host: String): ByteArray = buildString {
+        append("M-SEARCH * HTTP/1.1\r\n")
+        append("HOST: $host:$SSDP_PORT\r\n")
+        append("MAN: \"ssdp:discover\"\r\n")
+        append("MX: $SSDP_MX\r\n")
+        append("ST: $st\r\n")
+        append("\r\n")
+    }.toByteArray(Charsets.UTF_8)
+
+    private fun blockedReason(): String {
+        val vpn = appContext?.let { CastLocalNetwork.hasVpn(it) } == true
+        return "Nuvio can't reach your home network." +
+            if (vpn) " Allow local network access (LAN) in your VPN, or turn it off while casting." else ""
+    }
+
+    private fun describe(location: String): DlnaDevice? = try {
+        httpClient.newCall(Request.Builder().url(location).get().build()).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                Log.w(TAG, "GET $location failed ${resp.code}")
+                return@use null
+            }
+            val xml = resp.body.string()
+            val parsed = DlnaSoap.parseDeviceDescription(xml, location) ?: run {
+                // Not a renderer (no AVTransport), such as a router or media server.
+                Log.d(TAG, "No AVTransport in $location")
+                return@use null
+            }
+            DlnaDevice(
+                id = parsed.udn,
+                friendlyName = parsed.friendlyName,
+                modelName = parsed.modelName,
+                manufacturer = parsed.manufacturer,
+                locationUrl = location,
+                controlUrl = parsed.controlUrl,
+                eventSubUrl = parsed.eventSubUrl,
+                avTransportServiceType = parsed.serviceType,
+                ipAddress = runCatching { URL(location).host }.getOrNull(),
+                renderingControlUrl = parsed.renderingControlUrl,
+            ).also { Log.i(TAG, "Parsed device: ${it.friendlyName} control=${it.controlUrl}") }
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "Error fetching $location: ${e.message}")
+        null
     }
 
     private fun parseLocationHeader(response: String): String? {
         val lines = response.split("\r\n", "\n")
         for (line in lines) {
-            if (line.startsWith("LOCATION:", ignoreCase = true) || line.startsWith("Location:", ignoreCase = true)) {
+            if (line.startsWith("LOCATION:", ignoreCase = true)) {
                 return line.substringAfter(":").trim()
             }
         }
-        val regex = Regex("(?i)LOCATION:\\s*(\\S+)")
-        return regex.find(response)?.groupValues?.getOrNull(1)?.trim()
+        return null
     }
 
-    // Universal direct URL - no proxy, no transcode. TV must fetch original URL directly.
+    /**
+     * Gives the TV the original link when it can open it itself, which leaves the phone free.
+     * Downloads, local torrent streams and links that need headers go through the relay on the phone
+     * instead, since the TV can't open those.
+     */
     actual suspend fun prepareProxyUrl(request: DlnaCastRequest): String = withContext(Dispatchers.IO) {
-        // Direct URL to TV. Works for public https links, Chromecast, and DLNA TVs that support it.
-        // Torrents (127.0.0.1) will not work without proxy - intentionally removed per request.
-        Log.i(TAG, "Direct URL (no proxy) for ${request.sourceUrl.take(80)}")
-        request.sourceUrl
+        val url = request.sourceUrl
+        if (!canRelay(url)) return@withContext url
+        if (isLocalSource(url) || request.sourceHeaders.isNotEmpty()) {
+            relayUrl(request) ?: url
+        } else {
+            url
+        }
     }
 
     actual suspend fun castToDevice(device: DlnaDevice, request: DlnaCastRequest, proxyUrl: String): Boolean = withContext(Dispatchers.IO) {
-        // For universal mode, proxyUrl == sourceUrl (direct)
-        val directUrl = proxyUrl.ifBlank { request.sourceUrl }
-        val mime = request.mimeType.ifBlank { "video/mp4" }
+        val url = proxyUrl.ifBlank { request.sourceUrl }
+        val viaRelay = relay != null && url.startsWith("http://${localNetwork?.ownAddress?.hostAddress}:")
+        if (sendToTv(device, request, url, viaRelay)) {
+            if (viaRelay) keepRelayRunning(device) else stopRelayService()
+            return@withContext true
+        }
+        if (viaRelay || !canRelay(request.sourceUrl)) return@withContext false
+        // Often the TV can't open the link itself: a VPN only on the phone, a blocked server, redirects
+        // or headers it doesn't send. The phone can, so it fetches the video for the TV.
+        Log.i(TAG, "${device.friendlyName} couldn't open the link; relaying through the phone")
+        val relayed = relayUrl(request) ?: return@withContext false
+        sendToTv(device, request, relayed, viaRelay = true).also { if (it) keepRelayRunning(device) }
+    }
+
+    private fun sendToTv(device: DlnaDevice, request: DlnaCastRequest, url: String, viaRelay: Boolean): Boolean {
+        val mime = (if (viaRelay) currentRelayMime else null) ?: request.mimeType.ifBlank { "video/mp4" }
         val didl = DlnaSoap.buildDidlMetadata(
             title = request.title.ifBlank { "Nuvio Cast" },
-            proxyUrl = directUrl,
+            proxyUrl = url,
             mimeType = mime,
-            duration = request.durationMs?.let { DlnaSoap.formatDurationMs(it) }
+            duration = request.durationMs?.let { DlnaSoap.formatDurationMs(it) },
         )
-        val setUriBody = DlnaSoap.buildSetAvTransportUriBody(uri = directUrl, metadata = didl)
-        val playBody = DlnaSoap.buildPlayBody()
-
-        val client = httpClient
-
-        val setReq = Request.Builder()
-            .url(device.controlUrl)
-            .post(setUriBody.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
-            .header("Content-Type", "text/xml; charset=\"utf-8\"")
-            .header("SOAPACTION", "\"${device.avTransportServiceType}#SetAVTransportURI\"")
-            .build()
-
-        Log.i(TAG, "POST SetAVTransportURI to ${device.controlUrl} uri=$directUrl")
-        val setResp = client.newCall(setReq).execute()
-        val setBody = setResp.body?.string() ?: ""
-        Log.i(TAG, "SetAVTransportURI response ${setResp.code} body=${setBody.take(500)}")
-        if (!setResp.isSuccessful) {
-            Log.e(TAG, "SetAVTransportURI failed ${setResp.code}")
-            return@withContext false
+        val setUriBody = DlnaSoap.buildSetAvTransportUriBody(uri = url, metadata = didl)
+        Log.i(TAG, "SetAVTransportURI to ${device.controlUrl} uri=$url relay=$viaRelay")
+        if (!soap(device, "SetAVTransportURI", setUriBody)) {
+            // Some TVs refuse a new link while they're still playing; stopping first lets them take it.
+            soap(device, "Stop", DlnaSoap.buildStopBody())
+            if (!soap(device, "SetAVTransportURI", setUriBody)) return false
         }
-
         try { Thread.sleep(300) } catch (_: Exception) {}
+        if (!soap(device, "Play", DlnaSoap.buildPlayBody())) return false
+        if (request.startPositionMs > 5_000) {
+            // Pick up where the phone was; TVs only accept a seek once playback has started.
+            try { Thread.sleep(1500) } catch (_: Exception) {}
+            soap(device, "Seek", DlnaSoap.buildSeekBody(target = DlnaSoap.formatDurationMs(request.startPositionMs)))
+        }
+        return true
+    }
 
-        val playReq = Request.Builder()
+    private fun soap(device: DlnaDevice, action: String, body: String): Boolean = try {
+        val req = Request.Builder()
             .url(device.controlUrl)
-            .post(playBody.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
+            .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
             .header("Content-Type", "text/xml; charset=\"utf-8\"")
-            .header("SOAPACTION", "\"${device.avTransportServiceType}#Play\"")
+            .header("SOAPACTION", "\"${device.avTransportServiceType}#$action\"")
             .build()
+        httpClient.newCall(req).execute().use { resp ->
+            val text = resp.body.string()
+            Log.i(TAG, "$action response ${resp.code} body=${text.take(300)}")
+            resp.isSuccessful
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "$action failed: ${e.message}")
+        false
+    }
 
-        Log.i(TAG, "POST Play to ${device.controlUrl}")
-        val playResp = client.newCall(playReq).execute()
-        val playBodyResp = playResp.body?.string() ?: ""
-        Log.i(TAG, "Play response ${playResp.code} body=${playBodyResp.take(500)}")
-        playResp.isSuccessful
+    @Volatile private var currentRelayMime: String? = null
+
+    /** Starts (or reuses) the relay for [request] and returns the address for the TV, or null without Wi-Fi. */
+    private fun relayUrl(request: DlnaCastRequest): String? {
+        val network = localNetwork ?: refreshLocalNetwork()
+        val address = network?.ownAddress ?: return null
+        val relay = relay ?: try {
+            CastRelay(relayClient, address).also { relay = it }
+        } catch (e: Exception) {
+            Log.w(TAG, "Couldn't start the relay", e)
+            return null
+        }
+        val url = request.sourceUrl
+        val source = localFile(url)?.let { file ->
+            CastRelay.Source.LocalFile(file, CastRelay.mimeTypeFor(file.name))
+        } ?: CastRelay.Source.Remote(
+            url = url,
+            headers = request.sourceHeaders,
+            mimeType = request.mimeType.takeIf { it.startsWith("video/") && it != "video/mp4" } ?: CastRelay.mimeTypeFor(url),
+        )
+        currentRelayMime = source.mimeType
+        return relay.serve(source).also { Log.i(TAG, "Relaying ${url.take(80)} as $it (${source.mimeType})") }
+    }
+
+    private fun keepRelayRunning(device: DlnaDevice) {
+        appContext?.let { CastRelayService.start(it, device.friendlyName) }
+    }
+
+    private fun stopRelayService() {
+        appContext?.let { CastRelayService.stop(it) }
+    }
+
+    /** HLS and DASH point the TV at many files, which a simple relay can't pass on. */
+    private fun canRelay(url: String): Boolean {
+        val path = url.substringBefore('?').lowercase()
+        return !path.endsWith(".m3u8") && !path.endsWith(".mpd")
+    }
+
+    private fun isLocalSource(url: String): Boolean {
+        if (localFile(url) != null) return true
+        val host = runCatching { URL(url).host }.getOrNull()?.lowercase() ?: return false
+        return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+    }
+
+    private fun localFile(url: String): File? {
+        val file = when {
+            url.startsWith("file:", ignoreCase = true) -> runCatching { File(URI(url)) }.getOrNull()
+            url.startsWith("/") -> File(url)
+            else -> null
+        }
+        return file?.takeIf { it.isFile && it.canRead() }
     }
 
     actual suspend fun stopPlayback(device: DlnaDevice): Boolean = withContext(Dispatchers.IO) {
@@ -345,6 +437,8 @@ internal actual object DlnaCastPlatform {
     }
 
     actual suspend fun getLocalIpAddress(): String? = withContext(Dispatchers.IO) {
+        // The Wi-Fi address, never the VPN's, which TVs can't reach.
+        (localNetwork ?: refreshLocalNetwork())?.ownAddress?.hostAddress?.let { return@withContext it }
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
@@ -385,7 +479,9 @@ internal actual object DlnaCastPlatform {
     }
 
     actual fun stopProxy() {
-        // No-op now - proxy removed, direct URL only
-        Log.i(TAG, "stopProxy no-op (proxy removed)")
+        relay?.close()
+        relay = null
+        currentRelayMime = null
+        stopRelayService()
     }
 }
