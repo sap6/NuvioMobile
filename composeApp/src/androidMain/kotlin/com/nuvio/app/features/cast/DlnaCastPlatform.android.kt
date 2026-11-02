@@ -241,7 +241,12 @@ internal actual object DlnaCastPlatform {
             if (!soap(device, "SetAVTransportURI", setUriBody)) return false
         }
         try { Thread.sleep(300) } catch (_: Exception) {}
-        if (!soap(device, "Play", DlnaSoap.buildPlayBody())) return false
+        // TVs such as LG's start playing as soon as they get the link, then refuse Play or hold its
+        // reply until they've buffered. What counts is whether the TV ends up playing.
+        if (!soap(device, "Play", DlnaSoap.buildPlayBody(), slowClient) && !isPlayingOrStarting(device)) {
+            Log.w(TAG, "${device.friendlyName} didn't start playing")
+            return false
+        }
         if (request.startPositionMs > 5_000) {
             // Pick up where the phone was; TVs only accept a seek once playback has started.
             try { Thread.sleep(1500) } catch (_: Exception) {}
@@ -250,14 +255,46 @@ internal actual object DlnaCastPlatform {
         return true
     }
 
-    private fun soap(device: DlnaDevice, action: String, body: String): Boolean = try {
+    /** Asks the TV a few times whether it's playing, since starting a video can take it a few seconds. */
+    private fun isPlayingOrStarting(device: DlnaDevice): Boolean {
+        repeat(5) { attempt ->
+            if (attempt > 0) try { Thread.sleep(1000) } catch (_: Exception) {}
+            val state = soapResponse(device, "GetTransportInfo", DlnaSoap.buildGetTransportInfoBody())
+                ?.let(DlnaSoap::parseTransportState)
+            Log.i(TAG, "Transport state: $state")
+            when (state) {
+                "PLAYING", "TRANSITIONING", "PAUSED_PLAYBACK" -> return true
+                "NO_MEDIA_PRESENT" -> return false
+            }
+        }
+        return false
+    }
+
+    /** For Play, which some TVs only answer once the video has started. */
+    private val slowClient: OkHttpClient
+        get() = httpClient.newBuilder().readTimeout(20, TimeUnit.SECONDS).build()
+
+    private fun soapResponse(device: DlnaDevice, action: String, body: String): String? = try {
         val req = Request.Builder()
             .url(device.controlUrl)
             .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
             .header("Content-Type", "text/xml; charset=\"utf-8\"")
             .header("SOAPACTION", "\"${device.avTransportServiceType}#$action\"")
             .build()
-        httpClient.newCall(req).execute().use { resp ->
+        httpClient.newCall(req).execute().use { resp -> if (resp.isSuccessful) resp.body.string() else null }
+    } catch (e: Exception) {
+        Log.w(TAG, "$action failed: ${e.message}")
+        null
+    }
+
+    private fun soap(device: DlnaDevice, action: String, body: String, client: OkHttpClient = httpClient): Boolean = try {
+        val req = Request.Builder()
+            .url(device.controlUrl)
+            .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
+            .header("Content-Type", "text/xml; charset=\"utf-8\"")
+            .header("SOAPACTION", "\"${device.avTransportServiceType}#$action\"")
+            .build()
+        client.newCall(req).execute().use { resp ->
             val text = resp.body.string()
             Log.i(TAG, "$action response ${resp.code} body=${text.take(300)}")
             resp.isSuccessful

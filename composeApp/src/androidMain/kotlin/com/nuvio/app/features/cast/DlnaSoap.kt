@@ -33,6 +33,14 @@ internal object DlnaSoap {
     fun buildGetPositionInfoBody(instanceId: Int = 0): String =
         """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetPositionInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>$instanceId</InstanceID></u:GetPositionInfo></s:Body></s:Envelope>"""
 
+    fun buildGetTransportInfoBody(instanceId: Int = 0): String =
+        """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetTransportInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>$instanceId</InstanceID></u:GetTransportInfo></s:Body></s:Envelope>"""
+
+    /** The renderer's CurrentTransportState, such as PLAYING, TRANSITIONING or STOPPED. */
+    fun parseTransportState(xml: String): String? =
+        Regex("<CurrentTransportState[^>]*>([^<]+)</CurrentTransportState>", RegexOption.IGNORE_CASE)
+            .find(xml)?.groupValues?.getOrNull(1)?.trim()?.uppercase()
+
     fun buildSetVolumeBody(instanceId: Int = 0, channel: String = "Master", desiredVolume: Int): String =
         """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:SetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"><InstanceID>$instanceId</InstanceID><Channel>$channel</Channel><DesiredVolume>$desiredVolume</DesiredVolume></u:SetVolume></s:Body></s:Envelope>"""
 

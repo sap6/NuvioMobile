@@ -40,7 +40,9 @@ object UnifiedCastRepository {
         private set
 
     fun startScan() {
-        if (_state.value is UnifiedCastState.Scanning) return
+        // Opening the cast sheet while casting must not drop the casting state, or the phone takes
+        // playback back and loses its remote controls.
+        if (_state.value is UnifiedCastState.Scanning || _state.value is UnifiedCastState.Casting) return
         scanJob?.cancel()
         _state.value = UnifiedCastState.Scanning
         scanJob = scope.launch {
