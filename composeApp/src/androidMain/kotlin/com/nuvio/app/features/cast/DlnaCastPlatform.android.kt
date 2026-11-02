@@ -204,7 +204,7 @@ internal actual object DlnaCastPlatform {
         val url = request.sourceUrl
         if (!canRelay(url)) return@withContext url
         if (isLocalSource(url) || request.sourceHeaders.isNotEmpty()) {
-            relayUrl(request) ?: url
+            relayVideo(request) ?: url
         } else {
             url
         }
@@ -212,91 +212,130 @@ internal actual object DlnaCastPlatform {
 
     actual suspend fun castToDevice(device: DlnaDevice, request: DlnaCastRequest, proxyUrl: String): Boolean = withContext(Dispatchers.IO) {
         val url = proxyUrl.ifBlank { request.sourceUrl }
-        val viaRelay = relay != null && url.startsWith("http://${localNetwork?.ownAddress?.hostAddress}:")
+        val viaRelay = relay?.isVideoUrl(url) == true
         if (sendToTv(device, request, url, viaRelay)) {
-            if (viaRelay) keepRelayRunning(device) else stopRelayService()
+            if (viaRelay) keepRelayRunning(device) else if (relay?.hasSubtitle != true) stopRelayService()
             return@withContext true
         }
         if (viaRelay || !canRelay(request.sourceUrl)) return@withContext false
         // Often the TV can't open the link itself: a VPN only on the phone, a blocked server, redirects
         // or headers it doesn't send. The phone can, so it fetches the video for the TV.
         Log.i(TAG, "${device.friendlyName} couldn't open the link; relaying through the phone")
-        val relayed = relayUrl(request) ?: return@withContext false
+        val relayed = relayVideo(request) ?: return@withContext false
         sendToTv(device, request, relayed, viaRelay = true).also { if (it) keepRelayRunning(device) }
     }
 
-    private fun sendToTv(device: DlnaDevice, request: DlnaCastRequest, url: String, viaRelay: Boolean): Boolean {
-        val mime = (if (viaRelay) currentRelayMime else null) ?: request.mimeType.ifBlank { "video/mp4" }
+    /**
+     * Shows [request]'s subtitle (or none) on the TV. DLNA has no command to change subtitles, so the
+     * video is sent again with the new subtitle and picks up at [positionMs], the way other DLNA apps do it.
+     */
+    actual suspend fun changeSubtitle(device: DlnaDevice, request: DlnaCastRequest, positionMs: Long): Boolean = withContext(Dispatchers.IO) {
+        val url = lastVideoUrl ?: return@withContext false
+        val ok = sendToTv(device, request.copy(startPositionMs = positionMs), url, viaRelay = relay?.isVideoUrl(url) == true)
+        if (ok && relay?.hasSubtitle == true) keepRelayRunning(device)
+        ok
+    }
+
+    @Volatile private var lastVideoUrl: String? = null
+
+    private fun sendToTv(device: DlnaDevice, request: DlnaCastRequest, url: String, viaRelay: Boolean): Boolean = commandLock.withLockBlocking {
+        lastVideoUrl = url
+        val mime = (if (viaRelay) relay?.videoMimeType else null) ?: request.mimeType.ifBlank { "video/mp4" }
+        val subtitleUrl = request.subtitleUrl?.let { relaySubtitle(it, request.subtitleHeaders) }
+        if (request.subtitleUrl == null) relay?.clearSubtitle()
         val didl = DlnaSoap.buildDidlMetadata(
             title = request.title.ifBlank { "Nuvio Cast" },
             proxyUrl = url,
             mimeType = mime,
             duration = request.durationMs?.let { DlnaSoap.formatDurationMs(it) },
+            subtitleUrl = subtitleUrl,
         )
         val setUriBody = DlnaSoap.buildSetAvTransportUriBody(uri = url, metadata = didl)
-        Log.i(TAG, "SetAVTransportURI to ${device.controlUrl} uri=$url relay=$viaRelay")
+        Log.i(TAG, "SetAVTransportURI to ${device.controlUrl} uri=$url relay=$viaRelay subtitle=$subtitleUrl")
         if (!soap(device, "SetAVTransportURI", setUriBody)) {
             // Some TVs refuse a new link while they're still playing; stopping first lets them take it.
             soap(device, "Stop", DlnaSoap.buildStopBody())
-            if (!soap(device, "SetAVTransportURI", setUriBody)) return false
+            if (!soap(device, "SetAVTransportURI", setUriBody)) return@withLockBlocking false
         }
-        try { Thread.sleep(300) } catch (_: Exception) {}
         // TVs such as LG's start playing as soon as they get the link, then refuse Play or hold its
         // reply until they've buffered. What counts is whether the TV ends up playing.
-        if (!soap(device, "Play", DlnaSoap.buildPlayBody(), slowClient) && !isPlayingOrStarting(device)) {
-            Log.w(TAG, "${device.friendlyName} didn't start playing")
-            return false
+        val played = soap(device, "Play", DlnaSoap.buildPlayBody(), slowClient)
+        if (!waitUntilPlaying(device, if (played) 8 else 5, acceptStarting = !played)) {
+            if (!played) {
+                Log.w(TAG, "${device.friendlyName} didn't start playing")
+                return@withLockBlocking false
+            }
         }
         if (request.startPositionMs > 5_000) {
             // Pick up where the phone was; TVs only accept a seek once playback has started.
-            try { Thread.sleep(1500) } catch (_: Exception) {}
             soap(device, "Seek", DlnaSoap.buildSeekBody(target = DlnaSoap.formatDurationMs(request.startPositionMs)))
         }
-        return true
+        true
     }
 
-    /** Asks the TV a few times whether it's playing, since starting a video can take it a few seconds. */
-    private fun isPlayingOrStarting(device: DlnaDevice): Boolean {
-        repeat(5) { attempt ->
-            if (attempt > 0) try { Thread.sleep(1000) } catch (_: Exception) {}
+    /** Waits (about a second per try) until the TV reports it's playing; false if it never does. */
+    private fun waitUntilPlaying(device: DlnaDevice, tries: Int, acceptStarting: Boolean = false): Boolean {
+        repeat(tries) { attempt ->
             val state = soapResponse(device, "GetTransportInfo", DlnaSoap.buildGetTransportInfoBody())
                 ?.let(DlnaSoap::parseTransportState)
-            Log.i(TAG, "Transport state: $state")
+            Log.d(TAG, "Transport state: $state")
             when (state) {
-                "PLAYING", "TRANSITIONING", "PAUSED_PLAYBACK" -> return true
+                "PLAYING", "PAUSED_PLAYBACK" -> return true
                 "NO_MEDIA_PRESENT" -> return false
+                "TRANSITIONING" -> if (acceptStarting && attempt == tries - 1) return true
             }
+            if (attempt < tries - 1) try { Thread.sleep(if (attempt == 0) 300 else 800) } catch (_: Exception) {}
         }
         return false
+    }
+
+    /**
+     * One request to the TV at a time: TVs answer slowly and some mishandle overlapping requests.
+     * Commands wait their turn; background checks skip when a command is under way.
+     */
+    private val commandLock = java.util.concurrent.locks.ReentrantLock()
+
+    private inline fun <T> java.util.concurrent.locks.ReentrantLock.withLockBlocking(block: () -> T): T {
+        lock()
+        try { return block() } finally { unlock() }
+    }
+
+    private inline fun <T> java.util.concurrent.locks.ReentrantLock.ifFree(block: () -> T?): T? {
+        if (!tryLock()) return null
+        try { return block() } finally { unlock() }
     }
 
     /** For Play, which some TVs only answer once the video has started. */
     private val slowClient: OkHttpClient
         get() = httpClient.newBuilder().readTimeout(20, TimeUnit.SECONDS).build()
 
-    private fun soapResponse(device: DlnaDevice, action: String, body: String): String? = try {
-        val req = Request.Builder()
-            .url(device.controlUrl)
+    private fun soapRequest(url: String, serviceType: String, action: String, body: String): Request =
+        Request.Builder()
+            .url(url)
             .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
             .header("Content-Type", "text/xml; charset=\"utf-8\"")
-            .header("SOAPACTION", "\"${device.avTransportServiceType}#$action\"")
+            .header("SOAPACTION", "\"$serviceType#$action\"")
             .build()
-        httpClient.newCall(req).execute().use { resp -> if (resp.isSuccessful) resp.body.string() else null }
+
+    private fun soapResponse(device: DlnaDevice, action: String, body: String): String? = try {
+        httpClient.newCall(soapRequest(device.controlUrl, device.avTransportServiceType, action, body)).execute()
+            .use { resp -> if (resp.isSuccessful) resp.body.string() else null }
     } catch (e: Exception) {
         Log.w(TAG, "$action failed: ${e.message}")
         null
     }
 
-    private fun soap(device: DlnaDevice, action: String, body: String, client: OkHttpClient = httpClient): Boolean = try {
-        val req = Request.Builder()
-            .url(device.controlUrl)
-            .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
-            .header("Content-Type", "text/xml; charset=\"utf-8\"")
-            .header("SOAPACTION", "\"${device.avTransportServiceType}#$action\"")
-            .build()
-        client.newCall(req).execute().use { resp ->
+    private fun soap(
+        device: DlnaDevice,
+        action: String,
+        body: String,
+        client: OkHttpClient = httpClient,
+        url: String = device.controlUrl,
+        serviceType: String = device.avTransportServiceType,
+    ): Boolean = try {
+        client.newCall(soapRequest(url, serviceType, action, body)).execute().use { resp ->
             val text = resp.body.string()
-            Log.i(TAG, "$action response ${resp.code} body=${text.take(300)}")
+            Log.i(TAG, "$action response ${resp.code}${if (resp.isSuccessful) "" else " body=${text.take(300)}"}")
             resp.isSuccessful
         }
     } catch (e: Exception) {
@@ -304,18 +343,21 @@ internal actual object DlnaCastPlatform {
         false
     }
 
-    @Volatile private var currentRelayMime: String? = null
-
-    /** Starts (or reuses) the relay for [request] and returns the address for the TV, or null without Wi-Fi. */
-    private fun relayUrl(request: DlnaCastRequest): String? {
+    private fun ensureRelay(): CastRelay? {
+        relay?.let { return it }
         val network = localNetwork ?: refreshLocalNetwork()
         val address = network?.ownAddress ?: return null
-        val relay = relay ?: try {
+        return try {
             CastRelay(relayClient, address).also { relay = it }
         } catch (e: Exception) {
             Log.w(TAG, "Couldn't start the relay", e)
-            return null
+            null
         }
+    }
+
+    /** Starts (or reuses) the relay for [request]'s video and returns the address for the TV, or null without Wi-Fi. */
+    private fun relayVideo(request: DlnaCastRequest): String? {
+        val relay = ensureRelay() ?: return null
         val url = request.sourceUrl
         val source = localFile(url)?.let { file ->
             CastRelay.Source.LocalFile(file, CastRelay.mimeTypeFor(file.name))
@@ -324,8 +366,15 @@ internal actual object DlnaCastPlatform {
             headers = request.sourceHeaders,
             mimeType = request.mimeType.takeIf { it.startsWith("video/") && it != "video/mp4" } ?: CastRelay.mimeTypeFor(url),
         )
-        currentRelayMime = source.mimeType
-        return relay.serve(source).also { Log.i(TAG, "Relaying ${url.take(80)} as $it (${source.mimeType})") }
+        return relay.serveVideo(source).also { Log.i(TAG, "Relaying ${url.take(80)} as $it (${source.mimeType})") }
+    }
+
+    /** Serves a subtitle (a downloaded file or an online one) to the TV as SRT, from the phone. */
+    private fun relaySubtitle(url: String, headers: Map<String, String>): String? {
+        val relay = ensureRelay() ?: return null
+        val source = localFile(url)?.let { CastRelay.SubtitleSource.LocalFile(it) }
+            ?: CastRelay.SubtitleSource.Remote(url, headers)
+        return relay.serveSubtitle(source)
     }
 
     private fun keepRelayRunning(device: DlnaDevice) {
@@ -358,118 +407,45 @@ internal actual object DlnaCastPlatform {
     }
 
     actual suspend fun stopPlayback(device: DlnaDevice): Boolean = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val client = httpClient
-            val body = DlnaSoap.buildStopBody()
-            val req = Request.Builder()
-                .url(device.controlUrl)
-                .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
-                .header("Content-Type", "text/xml; charset=\"utf-8\"")
-                .header("SOAPACTION", "\"${device.avTransportServiceType}#Stop\"")
-                .build()
-            val resp = client.newCall(req).execute()
-            Log.i(TAG, "Stop response ${resp.code}")
-            resp.isSuccessful
-        } catch (e: Exception) {
-            Log.w(TAG, "stopPlayback failed: ${e.message}")
-            false
-        }
+        commandLock.withLockBlocking { soap(device, "Stop", DlnaSoap.buildStopBody()) }
     }
 
     actual suspend fun pausePlayback(device: DlnaDevice): Boolean = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val client = httpClient
-            val body = DlnaSoap.buildPauseBody()
-            val req = Request.Builder()
-                .url(device.controlUrl)
-                .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
-                .header("Content-Type", "text/xml; charset=\"utf-8\"")
-                .header("SOAPACTION", "\"${device.avTransportServiceType}#Pause\"")
-                .build()
-            val resp = client.newCall(req).execute()
-            Log.i(TAG, "Pause response ${resp.code}")
-            resp.isSuccessful
-        } catch (e: Exception) {
-            Log.w(TAG, "pause failed: ${e.message}")
-            false
-        }
+        commandLock.withLockBlocking { soap(device, "Pause", DlnaSoap.buildPauseBody()) }
     }
 
     actual suspend fun resumePlayback(device: DlnaDevice): Boolean = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val client = httpClient
-            val body = DlnaSoap.buildPlayBody()
-            val req = Request.Builder()
-                .url(device.controlUrl)
-                .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
-                .header("Content-Type", "text/xml; charset=\"utf-8\"")
-                .header("SOAPACTION", "\"${device.avTransportServiceType}#Play\"")
-                .build()
-            val resp = client.newCall(req).execute()
-            Log.i(TAG, "Resume Play response ${resp.code}")
-            resp.isSuccessful
-        } catch (e: Exception) {
-            Log.w(TAG, "resume failed: ${e.message}")
-            false
+        commandLock.withLockBlocking { soap(device, "Play", DlnaSoap.buildPlayBody()) }
+    }
+
+    /** Null when the TV is busy with a command, so position checks never hold up the controls. */
+    actual suspend fun getPositionInfo(device: DlnaDevice): Long? = withContext(Dispatchers.IO) {
+        commandLock.ifFree {
+            soapResponse(device, "GetPositionInfo", DlnaSoap.buildGetPositionInfoBody())?.let(DlnaSoap::parsePositionInfo)
         }
     }
 
-    actual suspend fun getPositionInfo(device: DlnaDevice): Long? = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val client = httpClient
-            val body = DlnaSoap.buildGetPositionInfoBody()
-            val req = Request.Builder()
-                .url(device.controlUrl)
-                .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
-                .header("Content-Type", "text/xml; charset=\"utf-8\"")
-                .header("SOAPACTION", "\"${device.avTransportServiceType}#GetPositionInfo\"")
-                .build()
-            val resp = client.newCall(req).execute()
-            val xml = resp.body?.string() ?: return@withContext null
-            DlnaSoap.parsePositionInfo(xml)
-        } catch (e: Exception) {
-            Log.w(TAG, "getPositionInfo failed: ${e.message}")
-            null
+    actual suspend fun getTransportState(device: DlnaDevice): String? = withContext(Dispatchers.IO) {
+        commandLock.ifFree {
+            soapResponse(device, "GetTransportInfo", DlnaSoap.buildGetTransportInfoBody())?.let(DlnaSoap::parseTransportState)
         }
     }
 
     actual suspend fun seekPlayback(device: DlnaDevice, positionMs: Long): Boolean = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val client = httpClient
-            val target = DlnaSoap.formatDurationMs(positionMs)
-            val body = DlnaSoap.buildSeekBody(target = target)
-            val req = Request.Builder()
-                .url(device.controlUrl)
-                .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
-                .header("Content-Type", "text/xml; charset=\"utf-8\"")
-                .header("SOAPACTION", "\"${device.avTransportServiceType}#Seek\"")
-                .build()
-            val resp = client.newCall(req).execute()
-            Log.i(TAG, "Seek $target response ${resp.code}")
-            resp.isSuccessful
-        } catch (e: Exception) {
-            Log.w(TAG, "seek failed: ${e.message}")
-            false
+        commandLock.withLockBlocking {
+            soap(device, "Seek", DlnaSoap.buildSeekBody(target = DlnaSoap.formatDurationMs(positionMs)))
         }
     }
 
     actual suspend fun setVolume(device: DlnaDevice, volumePercent: Int): Boolean = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val client = httpClient
-            val renderingUrl = device.renderingControlUrl ?: device.controlUrl
-            val body = DlnaSoap.buildSetVolumeBody(desiredVolume = volumePercent.coerceIn(0, 100))
-            val req = Request.Builder()
-                .url(renderingUrl)
-                .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
-                .header("Content-Type", "text/xml; charset=\"utf-8\"")
-                .header("SOAPACTION", "\"urn:schemas-upnp-org:service:RenderingControl:1#SetVolume\"")
-                .build()
-            val resp = client.newCall(req).execute()
-            Log.i(TAG, "SetVolume $volumePercent response ${resp.code}")
-            resp.isSuccessful
-        } catch (e: Exception) {
-            Log.w(TAG, "setVolume failed: ${e.message}")
-            false
+        commandLock.withLockBlocking {
+            soap(
+                device,
+                "SetVolume",
+                DlnaSoap.buildSetVolumeBody(desiredVolume = volumePercent.coerceIn(0, 100)),
+                url = device.renderingControlUrl ?: device.controlUrl,
+                serviceType = "urn:schemas-upnp-org:service:RenderingControl:1",
+            )
         }
     }
 
@@ -518,7 +494,7 @@ internal actual object DlnaCastPlatform {
     actual fun stopProxy() {
         relay?.close()
         relay = null
-        currentRelayMime = null
+        lastVideoUrl = null
         stopRelayService()
     }
 }

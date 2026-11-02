@@ -34,6 +34,11 @@ internal class CastRelay(
         data class Remote(val url: String, val headers: Map<String, String>, override val mimeType: String) : Source
     }
 
+    sealed interface SubtitleSource {
+        data class LocalFile(val file: File) : SubtitleSource
+        data class Remote(val url: String, val headers: Map<String, String>) : SubtitleSource
+    }
+
     private val server = ServerSocket(0, 16, address)
 
     /** A random path, so other devices on the network can't use the relay to read files or reach providers. */
@@ -41,6 +46,17 @@ internal class CastRelay(
 
     @Volatile private var source: Source? = null
     @Volatile private var generation = 0
+    @Volatile private var subtitle: SubtitleSource? = null
+    @Volatile private var subtitleGeneration = 0
+    /** The converted subtitle, fetched once: TVs ask for it more than once. */
+    @Volatile private var subtitleBytes: ByteArray? = null
+
+    private val base get() = "http://${address.hostAddress}:${server.localPort}/$token"
+
+    val videoMimeType: String? get() = source?.mimeType
+    val hasSubtitle: Boolean get() = subtitle != null
+
+    fun isVideoUrl(url: String): Boolean = source != null && url.startsWith("$base/$generation/")
     private val clients = Collections.synchronizedSet(HashSet<Socket>())
 
     init {
@@ -67,13 +83,29 @@ internal class CastRelay(
     }
 
     /** Points the relay at [newSource] and returns the address to give the TV. */
-    fun serve(newSource: Source): String {
+    fun serveVideo(newSource: Source): String {
         source = newSource
         generation++
         // Connections for the previous video would otherwise keep reading it.
         synchronized(clients) { clients.toList() }.forEach { runCatching { it.close() } }
         // A new path per video, so the TV doesn't treat a new video as the same one.
-        return "http://${address.hostAddress}:${server.localPort}/$token/$generation/video.${extensionFor(newSource.mimeType)}"
+        return "$base/$generation/video.${extensionFor(newSource.mimeType)}"
+    }
+
+    /** Serves [newSource] as SRT and returns its address, or reuses it when it's the subtitle already served. */
+    fun serveSubtitle(newSource: SubtitleSource): String {
+        if (newSource != subtitle) {
+            subtitle = newSource
+            subtitleBytes = null
+            subtitleGeneration++
+        }
+        // A new name per subtitle, so the TV doesn't reuse the one it cached.
+        return "$base/sub$subtitleGeneration/subtitle.srt"
+    }
+
+    fun clearSubtitle() {
+        subtitle = null
+        subtitleBytes = null
     }
 
     override fun close() {
@@ -97,9 +129,10 @@ internal class CastRelay(
         val method = parts.getOrNull(0).orEmpty()
         val path = parts.getOrNull(1).orEmpty()
         val out = socket.getOutputStream()
+        if (method != "GET" && method != "HEAD") return out.respond("405 Method Not Allowed")
+        if (path.startsWith("/$token/sub$subtitleGeneration/")) return serveSubtitle(method == "HEAD", out)
         val current = source
         if (current == null || !path.startsWith("/$token/$generation/")) return out.respond("404 Not Found")
-        if (method != "GET" && method != "HEAD") return out.respond("405 Method Not Allowed")
         val range = headers["range"]
         Log.d(TAG, "TV asked: $method range=$range")
         when (current) {
@@ -123,6 +156,7 @@ internal class CastRelay(
             append("Accept-Ranges: bytes\r\n")
             if (requested != null) append("Content-Range: bytes $start-$end/$length\r\n")
             append(dlnaHeaders(seekable = true))
+            append(captionHeader())
         }
         out.respond(status, headers, keepOpen = !headOnly)
         if (headOnly) return
@@ -174,6 +208,7 @@ internal class CastRelay(
                 response.header("Content-Range")?.let { append("Content-Range: $it\r\n") }
                 if (seekable) append("Accept-Ranges: bytes\r\n")
                 append(dlnaHeaders(seekable))
+                append(captionHeader())
             }
             val status = if (response.code == 206) "206 Partial Content" else "200 OK"
             out.respond(status, headers, keepOpen = !headOnly)
@@ -181,6 +216,41 @@ internal class CastRelay(
             response.body.byteStream().copyTo(out, BUFFER_SIZE)
             out.flush()
         }
+    }
+
+    /** Samsung TVs find the subtitle through this header on the video. */
+    private fun captionHeader(): String =
+        if (subtitle != null) "CaptionInfo.sec: $base/sub$subtitleGeneration/subtitle.srt\r\n" else ""
+
+    private fun serveSubtitle(headOnly: Boolean, out: OutputStream) {
+        val bytes = subtitleBytes ?: loadSubtitle()?.also { subtitleBytes = it }
+            ?: return out.respond("404 Not Found")
+        out.respond(
+            "200 OK",
+            "Content-Type: text/srt; charset=utf-8\r\nContent-Length: ${bytes.size}\r\n" +
+                "transferMode.dlna.org: Interactive\r\n",
+            keepOpen = !headOnly,
+        )
+        if (!headOnly) {
+            out.write(bytes)
+            out.flush()
+        }
+    }
+
+    private fun loadSubtitle(): ByteArray? {
+        val text = when (val current = subtitle ?: return null) {
+            is SubtitleSource.LocalFile -> runCatching { current.file.readText() }.getOrNull()
+            is SubtitleSource.Remote -> try {
+                val request = Request.Builder().url(current.url)
+                    .apply { current.headers.forEach { (name, value) -> header(name, value) } }
+                    .build()
+                http.newCall(request).execute().use { if (it.isSuccessful) it.body.string() else null }
+            } catch (e: IOException) {
+                Log.w(TAG, "Couldn't fetch the subtitle", e)
+                null
+            }
+        } ?: return null
+        return toSrt(text).toByteArray(Charsets.UTF_8)
     }
 
     private fun OutputStream.respond(status: String, headers: String = "Content-Length: 0\r\n", keepOpen: Boolean = false) {
@@ -234,6 +304,38 @@ internal class CastRelay(
 
         fun contentFeatures(seekable: Boolean): String =
             "DLNA.ORG_OP=${if (seekable) "01" else "00"};DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+
+        private val VTT_TIME = Regex("""(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{3})""")
+
+        /**
+         * TVs read SRT; online subtitles are often WebVTT. Converts VTT cues to numbered SRT cues with
+         * comma milliseconds and no position settings or styling tags; SRT passes through unchanged.
+         */
+        fun toSrt(text: String): String {
+            val clean = text.removePrefix("\uFEFF").replace("\r\n", "\n")
+            if (!clean.trimStart().startsWith("WEBVTT")) return clean
+            val out = StringBuilder()
+            var number = 0
+            for (block in clean.split(Regex("\n{2,}"))) {
+                val lines = block.lines().filter { it.isNotBlank() }
+                val timingIndex = lines.indexOfFirst { "-->" in it }
+                if (timingIndex < 0) continue // header, NOTE or STYLE block
+                val (from, to) = lines[timingIndex].split("-->").map { it.trim().substringBefore(' ') }
+                    .takeIf { it.size == 2 } ?: continue
+                val start = vttTime(from) ?: continue
+                val end = vttTime(to) ?: continue
+                val cue = lines.drop(timingIndex + 1).joinToString("\n") { it.replace(Regex("</?(c|v|lang|ruby|rt)[^>]*>"), "") }
+                number++
+                out.append(number).append('\n').append(start).append(" --> ").append(end).append('\n').append(cue).append("\n\n")
+            }
+            return out.toString()
+        }
+
+        private fun vttTime(value: String): String? {
+            val match = VTT_TIME.matchEntire(value) ?: return null
+            val (h, m, sec, ms) = match.destructured
+            return "%02d:%02d:%02d,%s".format(h.ifEmpty { "0" }.toInt(), m.toInt(), sec.toInt(), ms)
+        }
 
         fun mimeTypeFor(path: String): String {
             val lower = path.substringBefore('?').lowercase()

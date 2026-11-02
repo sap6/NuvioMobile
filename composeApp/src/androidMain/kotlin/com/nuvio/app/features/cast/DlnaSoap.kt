@@ -5,11 +5,31 @@ import org.xmlpull.v1.XmlPullParser
 
 internal object DlnaSoap {
 
-    fun buildDidlMetadata(title: String, proxyUrl: String, mimeType: String, duration: String? = null): String {
+    /**
+     * DIDL-Lite description of the video. A subtitle is announced in each of the ways TV makers look
+     * for it: a text/srt resource, Samsung's CaptionInfo elements and the pv:subtitleFileUri attribute
+     * that LG and others read.
+     */
+    fun buildDidlMetadata(
+        title: String,
+        proxyUrl: String,
+        mimeType: String,
+        duration: String? = null,
+        subtitleUrl: String? = null,
+    ): String {
         val escapedTitle = xmlEscape(title)
         val escapedUrl = xmlEscape(proxyUrl)
         val durationAttr = if (duration != null) """ duration="$duration"""" else ""
-        return """<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"><item id="0" parentID="0" restricted="1"><dc:title>$escapedTitle</dc:title><upnp:class>object.item.videoItem</upnp:class><res protocolInfo="http-get:*:$mimeType:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"$durationAttr>$escapedUrl</res></item></DIDL-Lite>"""
+        val sub = subtitleUrl?.let(::xmlEscape)
+        val subAttrs = if (sub != null) """ pv:subtitleFileUri="$sub" pv:subtitleFileType="srt"""" else ""
+        val subElements = if (sub != null) {
+            """<res protocolInfo="http-get:*:text/srt:*">$sub</res>""" +
+                """<sec:CaptionInfoEx sec:type="srt">$sub</sec:CaptionInfoEx>""" +
+                """<sec:CaptionInfo sec:type="srt">$sub</sec:CaptionInfo>"""
+        } else {
+            ""
+        }
+        return """<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/" xmlns:sec="http://www.sec.co.kr/" xmlns:pv="http://www.pv.com/pvns/"><item id="0" parentID="0" restricted="1"><dc:title>$escapedTitle</dc:title><upnp:class>object.item.videoItem</upnp:class><res protocolInfo="http-get:*:$mimeType:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"$durationAttr$subAttrs>$escapedUrl</res>$subElements</item></DIDL-Lite>"""
     }
 
     fun buildSetAvTransportUriBody(instanceId: Int = 0, uri: String, metadata: String): String {

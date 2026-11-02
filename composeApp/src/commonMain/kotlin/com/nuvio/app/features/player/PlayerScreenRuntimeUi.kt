@@ -769,6 +769,8 @@ private fun PlayerScreenRuntime.RenderPlayerModals(displayedPositionMs: Long) {
             }
             if (UnifiedCastRepository.state.value is UnifiedCastState.Casting) {
                 UnifiedCastRepository.setActiveSubtitleTrack(if (index < 0) null else (index + 1).toLong())
+                // DLNA TVs pick built-in subtitle tracks themselves; drop any subtitle file sent from the phone.
+                UnifiedCastRepository.setCastSubtitle(null, emptyMap(), playbackSnapshot.positionMs)
             }
         },
         onAddonSubtitleSelected = { addon ->
@@ -784,6 +786,11 @@ private fun PlayerScreenRuntime.RenderPlayerModals(displayedPositionMs: Long) {
                 val addonIdx = addonSubtitles.indexOfFirst { it.selectionKey == addon.selectionKey }
                 val trackId = if (addonIdx >= 0) (externalSubtitles.size + addonIdx + 1).toLong() else null
                 UnifiedCastRepository.setActiveSubtitleTrack(trackId)
+                UnifiedCastRepository.setCastSubtitle(
+                    url = addon.url,
+                    headers = externalSubtitles.firstOrNull { it.url == addon.url }?.headers ?: emptyMap(),
+                    positionMs = playbackSnapshot.positionMs,
+                )
             }
         },
         onFetchAddonSubtitles = { fetchAddonSubtitlesForActiveItem() },
@@ -955,7 +962,7 @@ private fun PlayerScreenRuntime.RenderCastingOverlay() {
 
     var remotePosMs by remember { mutableStateOf(playbackSnapshot.positionMs) }
     val remoteDurationMs = playbackSnapshot.durationMs
-    var isRemotePaused by remember { mutableStateOf(false) }
+    var isRemotePaused by remember { mutableStateOf(UnifiedCastRepository.isPaused) }
     var isScrubbingRemote by remember { mutableStateOf(false) }
     var scrubRemoteMs by remember { mutableStateOf<Long?>(null) }
     var remoteVolume by remember { mutableStateOf(UnifiedCastRepository.volume) }
@@ -969,10 +976,20 @@ private fun PlayerScreenRuntime.RenderCastingOverlay() {
                 val pos = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     UnifiedCastRepository.getPosition()
                 }
+                tickCount++
+                if (tickCount % 2 == 0) {
+                    // Follow play/pause changes made with the TV remote.
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        UnifiedCastRepository.getRemotePaused()
+                    }?.let { isRemotePaused = it }
+                }
+                if ((pos == null || pos < 0L) && !isRemotePaused && !isScrubbingRemote) {
+                    // No fresh reading (a command is under way): keep the clock moving so it doesn't freeze.
+                    remotePosMs = if (remoteDurationMs > 0) minOf(remotePosMs + 1000, remoteDurationMs) else remotePosMs + 1000
+                }
                 if (pos != null && pos >= 0L) {
                     remotePosMs = pos
                     playbackSnapshot = playbackSnapshot.copy(positionMs = pos)
-                    tickCount++
                     if (tickCount % 5 == 0) {
                         WatchProgressRepository.upsertPlaybackProgress(
                             session = playbackSession,
