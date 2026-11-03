@@ -28,6 +28,17 @@ data class DlnaCastRequest(
     val subtitleHeaders: Map<String, String> = emptyMap(),
     val startPositionMs: Long = 0L,
     val posterUrl: String? = null,
+    /**
+     * The built-in audio track to play, counted from 0 among the file's audio tracks in file order
+     * (the phone player's numbering); null keeps the file's default. The language helps match it.
+     */
+    val audioTrackIndex: Int? = null,
+    val audioTrackLanguage: String? = null,
+    /** The built-in subtitle track to show, numbered like [audioTrackIndex]; null with [builtInSubtitlesOff] false keeps the file's default. */
+    val subtitleTrackIndex: Int? = null,
+    val subtitleTrackLanguage: String? = null,
+    /** Hide the file's own subtitles, for "Off" or when a subtitle file is sent instead. */
+    val builtInSubtitlesOff: Boolean = false,
 )
 
 sealed interface DlnaCastState {

@@ -59,7 +59,8 @@ object UnifiedCastRepository {
         data class PlayState(val play: Boolean) : RemoteCommand
         data class Seek(val positionMs: Long) : RemoteCommand
         data class Volume(val fraction: Float) : RemoteCommand
-        data class Subtitle(val url: String?, val headers: Map<String, String>, val positionMs: Long) : RemoteCommand
+        /** Sends the video again with [update] applied to the request: other tracks or another subtitle file. */
+        class Reload(val update: (DlnaCastRequest) -> DlnaCastRequest, val positionMs: Long) : RemoteCommand
     }
 
     private val commands = Channel<RemoteCommand>(Channel.UNLIMITED)
@@ -86,7 +87,7 @@ object UnifiedCastRepository {
             CastLog.add("Phone: running ${batch.joinToString { it.describe() }}")
             try {
                 if (dev != null) {
-                    batch.lastOrNull { it is RemoteCommand.Subtitle }?.let { applySubtitle(dev, it as RemoteCommand.Subtitle) }
+                    batch.filterIsInstance<RemoteCommand.Reload>().takeIf { it.isNotEmpty() }?.let { applyReload(dev, it) }
                     batch.lastOrNull { it is RemoteCommand.Seek }?.let { applySeek(dev, (it as RemoteCommand.Seek).positionMs) }
                     batch.lastOrNull { it is RemoteCommand.PlayState }?.let { applyPlayState(dev, (it as RemoteCommand.PlayState).play) }
                     batch.lastOrNull { it is RemoteCommand.Volume }?.let { applyVolume(dev, (it as RemoteCommand.Volume).fraction) }
@@ -130,13 +131,16 @@ object UnifiedCastRepository {
         }
     }
 
-    private suspend fun applySubtitle(dev: UnifiedCastDevice, command: RemoteCommand.Subtitle) {
+    private suspend fun applyReload(dev: UnifiedCastDevice, reloads: List<RemoteCommand.Reload>) {
         val device = dev.dlnaDevice ?: return
-        val request = (currentRequest ?: return).copy(subtitleUrl = command.url, subtitleHeaders = command.headers)
+        val previous = currentRequest ?: return
+        val request = reloads.fold(previous) { request, reload -> reload.update(request) }
+        if (request == previous) return
         currentRequest = request
+        val command = reloads.last()
         // Sending the video again restarts it; hold position readings until it has caught up.
         positionSettlesAt = TimeSource.Monotonic.markNow() + 6000.milliseconds
-        DlnaCastPlatform.changeSubtitle(device, request, command.positionMs)
+        DlnaCastPlatform.changeTracks(device, request, command.positionMs)
         isPaused = false
         positionSettlesAt = TimeSource.Monotonic.markNow() + 1500.milliseconds
     }
@@ -145,7 +149,7 @@ object UnifiedCastRepository {
         is RemoteCommand.PlayState -> if (play) "play" else "pause"
         is RemoteCommand.Seek -> "seek to ${positionMs / 1000}s"
         is RemoteCommand.Volume -> "volume ${(fraction * 100).toInt()}"
-        is RemoteCommand.Subtitle -> "subtitle ${url?.let(CastLog::shortUrl) ?: "off"}"
+        is RemoteCommand.Reload -> "change tracks"
     }
 
     /** Forgets queued commands and settling windows, so nothing carries over to the next cast. */
@@ -379,14 +383,13 @@ object UnifiedCastRepository {
     }
 
     /**
-     * Shows a subtitle file (or none, with a null [url]) on a DLNA TV, from [positionMs]. Chromecast
-     * switches tracks with [setActiveSubtitleTrack] instead.
+     * Changes what a DLNA TV plays alongside the video (audio track, built-in subtitle, subtitle file)
+     * by sending it again from [positionMs]. Chromecast switches tracks with [setActiveSubtitleTrack].
      */
-    fun setCastSubtitle(url: String?, headers: Map<String, String>, positionMs: Long) {
+    fun updateCastTracks(positionMs: Long, update: (DlnaCastRequest) -> DlnaCastRequest) {
         val dev = currentDevice ?: return
         if (dev.protocol != CastProtocol.DLNA && dev.protocol != CastProtocol.DIAL) return
-        if (url == currentRequest?.subtitleUrl) return
-        send(RemoteCommand.Subtitle(url, headers, positionMs))
+        send(RemoteCommand.Reload(update, positionMs))
     }
 
     // Capability sniffing - checks GetProtocolInfo for DLNA, assumes modern for Cast

@@ -13,6 +13,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
+import java.io.RandomAccessFile
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -231,8 +232,15 @@ internal actual object DlnaCastPlatform {
      * Shows [request]'s subtitle (or none) on the TV. DLNA has no command to change subtitles, so the
      * video is sent again with the new subtitle and picks up at [positionMs], the way other DLNA apps do it.
      */
-    actual suspend fun changeSubtitle(device: DlnaDevice, request: DlnaCastRequest, positionMs: Long): Boolean = withContext(Dispatchers.IO) {
-        val url = lastVideoUrl ?: return@withContext false
+    actual suspend fun changeTracks(device: DlnaDevice, request: DlnaCastRequest, positionMs: Long): Boolean = withContext(Dispatchers.IO) {
+        val previous = lastVideoUrl ?: return@withContext false
+        // A download goes out again with the new tracks marked as default, under a new address so the
+        // TV reloads it; other videos keep their address and only the subtitle file changes.
+        val url = if (relay?.isVideoUrl(previous) == true && localFile(request.sourceUrl) != null) {
+            relayVideo(request) ?: previous
+        } else {
+            previous
+        }
         val ok = sendToTv(device, request.copy(startPositionMs = positionMs), url, viaRelay = relay?.isVideoUrl(url) == true)
         if (ok && relay?.hasSubtitle == true) keepRelayRunning(device)
         ok
@@ -384,13 +392,63 @@ internal actual object DlnaCastPlatform {
         val relay = ensureRelay() ?: return null
         val url = request.sourceUrl
         val source = localFile(url)?.let { file ->
-            CastRelay.Source.LocalFile(file, CastRelay.mimeTypeFor(file.name))
+            CastRelay.Source.LocalFile(file, CastRelay.mimeTypeFor(file.name), trackPatches(file, request))
         } ?: CastRelay.Source.Remote(
             url = url,
             headers = request.sourceHeaders,
             mimeType = request.mimeType.takeIf { it.startsWith("video/") && it != "video/mp4" } ?: CastRelay.mimeTypeFor(url),
         )
         return relay.serveVideo(source).also { Log.i(TAG, "Relaying ${url.take(80)} as $it (${source.mimeType})") }
+    }
+
+    /**
+     * Edits that make an MKV download start with the phone's audio and subtitle choice on the TV.
+     * The phone numbers tracks in file order; the language confirms the match, and finds the track
+     * when the numbering doesn't line up (a player that lists tracks differently).
+     */
+    private fun trackPatches(file: File, request: DlnaCastRequest): List<MkvTrackFlags.Patch> {
+        val wantsSubtitles = request.subtitleTrackIndex != null || request.builtInSubtitlesOff
+        if (request.audioTrackIndex == null && !wantsSubtitles) return emptyList()
+        if (!file.name.endsWith(".mkv", ignoreCase = true) && !file.name.endsWith(".webm", ignoreCase = true)) {
+            CastLog.add("Tracks: not an MKV, the TV picks its own tracks")
+            return emptyList()
+        }
+        val tracks = RandomAccessFile(file, "r").use { MkvTrackFlags.readTracks(it) } ?: run {
+            CastLog.add("Tracks: couldn't read the MKV track list")
+            return emptyList()
+        }
+        val audio = tracks.filter { it.type == MkvTrackFlags.TYPE_AUDIO }
+        val subtitles = tracks.filter { it.type == MkvTrackFlags.TYPE_SUBTITLE }
+        CastLog.add(
+            "Tracks in file: audio ${audio.joinToString { it.language ?: "?" }}; " +
+                "subtitles ${subtitles.joinToString { it.language ?: "?" }.ifEmpty { "none" }}",
+        )
+        val audioIndex = request.audioTrackIndex?.let { matchTrack(audio, it, request.audioTrackLanguage) }
+        val subtitleIndex = if (request.builtInSubtitlesOff) {
+            null
+        } else {
+            request.subtitleTrackIndex?.let { matchTrack(subtitles, it, request.subtitleTrackLanguage) }
+        }
+        // A subtitle choice that matches no track in the file leaves the file's subtitles alone.
+        val touchSubtitles = request.builtInSubtitlesOff || subtitleIndex != null
+        val patches = MkvTrackFlags.patches(tracks, audioIndex, subtitleIndex, touchSubtitles)
+        CastLog.add(
+            "Tracks for TV: audio ${audioIndex?.let { "#${it + 1}" } ?: "as file"}, " +
+                "subtitle ${if (!touchSubtitles) "as file" else subtitleIndex?.let { "#${it + 1}" } ?: "off"} " +
+                "(${patches.size} edits)",
+        )
+        return patches
+    }
+
+    private fun matchTrack(tracks: List<MkvTrackFlags.Track>, index: Int, language: String?): Int? {
+        fun sameLanguage(a: String?, b: String?) =
+            a != null && b != null && a.take(2).equals(b.take(2), ignoreCase = true)
+        val byIndex = tracks.getOrNull(index)
+        if (byIndex != null && (language == null || byIndex.language == null || sameLanguage(byIndex.language, language))) {
+            return index
+        }
+        return tracks.indexOfFirst { sameLanguage(it.language, language) }.takeIf { it >= 0 }
+            ?: index.takeIf { it in tracks.indices }
     }
 
     /** Serves a subtitle (a downloaded file or an online one) to the TV as SRT, from the phone. */

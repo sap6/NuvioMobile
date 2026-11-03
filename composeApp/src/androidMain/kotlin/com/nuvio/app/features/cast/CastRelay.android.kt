@@ -30,7 +30,12 @@ internal class CastRelay(
     sealed interface Source {
         val mimeType: String
 
-        data class LocalFile(val file: File, override val mimeType: String) : Source
+        /** [patches] are edits made to the file's bytes as they're sent, such as which tracks are default. */
+        data class LocalFile(
+            val file: File,
+            override val mimeType: String,
+            val patches: List<MkvTrackFlags.Patch> = emptyList(),
+        ) : Source
         data class Remote(val url: String, val headers: Map<String, String>, override val mimeType: String) : Source
     }
 
@@ -171,15 +176,29 @@ internal class CastRelay(
         RandomAccessFile(source.file, "r").use { file ->
             file.seek(start)
             val buffer = ByteArray(BUFFER_SIZE)
+            var position = start
             var remaining = count
             while (remaining > 0) {
                 val read = file.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
                 if (read < 0) break
+                applyPatches(source.patches, buffer, position, read)
                 out.write(buffer, 0, read)
+                position += read
                 remaining -= read
             }
         }
         out.flush()
+    }
+
+    /** Writes the parts of [patches] that fall in the [length] bytes read from [position] into [buffer]. */
+    private fun applyPatches(patches: List<MkvTrackFlags.Patch>, buffer: ByteArray, position: Long, length: Int) {
+        for (patch in patches) {
+            val from = maxOf(patch.offset, position)
+            val to = minOf(patch.offset + patch.bytes.size, position + length)
+            for (offset in from until to) {
+                buffer[(offset - position).toInt()] = patch.bytes[(offset - patch.offset).toInt()]
+            }
+        }
     }
 
     private fun serveRemote(source: Source.Remote, headOnly: Boolean, range: String?, out: OutputStream) {

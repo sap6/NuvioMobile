@@ -9,7 +9,7 @@ internal actual object DlnaCastPlatform {
 
     actual suspend fun castToDevice(device: DlnaDevice, request: DlnaCastRequest, proxyUrl: String): Boolean = false
 
-    actual suspend fun changeSubtitle(device: DlnaDevice, request: DlnaCastRequest, positionMs: Long): Boolean = false
+    actual suspend fun changeTracks(device: DlnaDevice, request: DlnaCastRequest, positionMs: Long): Boolean = false
 
     actual suspend fun stopPlayback(device: DlnaDevice): Boolean = false
     actual suspend fun pausePlayback(device: DlnaDevice): Boolean = false

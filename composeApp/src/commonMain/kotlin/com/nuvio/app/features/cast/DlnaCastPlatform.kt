@@ -4,7 +4,7 @@ internal expect object DlnaCastPlatform {
     suspend fun scanDevices(timeoutMs: Int = 4000): DlnaScanResult
     suspend fun prepareProxyUrl(request: DlnaCastRequest): String
     suspend fun castToDevice(device: DlnaDevice, request: DlnaCastRequest, proxyUrl: String): Boolean
-    suspend fun changeSubtitle(device: DlnaDevice, request: DlnaCastRequest, positionMs: Long): Boolean
+    suspend fun changeTracks(device: DlnaDevice, request: DlnaCastRequest, positionMs: Long): Boolean
     suspend fun stopPlayback(device: DlnaDevice): Boolean
     suspend fun pausePlayback(device: DlnaDevice): Boolean
     suspend fun resumePlayback(device: DlnaDevice): Boolean

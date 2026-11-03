@@ -688,6 +688,11 @@ private fun PlayerScreenRuntime.RenderPlayerModals(displayedPositionMs: Long) {
             subtitleHeaders = subHeaders,
             startPositionMs = playbackSnapshot.positionMs,
             posterUrl = poster,
+            audioTrackIndex = selectedAudioIndex.takeIf { it >= 0 && serverAudioTracks.isEmpty() },
+            audioTrackLanguage = audioTracks.firstOrNull { it.index == selectedAudioIndex }?.language,
+            subtitleTrackIndex = selectedSubtitleIndex.takeIf { it >= 0 && !useCustomSubtitles },
+            subtitleTrackLanguage = subtitleTracks.firstOrNull { it.index == selectedSubtitleIndex }?.language,
+            builtInSubtitlesOff = useCustomSubtitles || selectedSubtitleIndex < 0,
         )
         com.nuvio.app.features.cast.CastBottomSheet(
             isVisible = showCastSheet,
@@ -728,6 +733,12 @@ private fun PlayerScreenRuntime.RenderPlayerModals(displayedPositionMs: Long) {
                 selectedAudioIndex = index
                 persistAudioPreference(audioTracks.firstOrNull { it.index == index })
                 playerController?.selectAudioTrack(index)
+                if (UnifiedCastRepository.state.value is UnifiedCastState.Casting) {
+                    val language = audioTracks.firstOrNull { it.index == index }?.language
+                    UnifiedCastRepository.updateCastTracks(playbackSnapshot.positionMs) {
+                        it.copy(audioTrackIndex = index, audioTrackLanguage = language)
+                    }
+                }
             }
             scope.launch {
                 kotlinx.coroutines.delay(200)
@@ -769,8 +780,17 @@ private fun PlayerScreenRuntime.RenderPlayerModals(displayedPositionMs: Long) {
             }
             if (UnifiedCastRepository.state.value is UnifiedCastState.Casting) {
                 UnifiedCastRepository.setActiveSubtitleTrack(if (index < 0) null else (index + 1).toLong())
-                // DLNA TVs pick built-in subtitle tracks themselves; drop any subtitle file sent from the phone.
-                UnifiedCastRepository.setCastSubtitle(null, emptyMap(), playbackSnapshot.positionMs)
+                // Show the same built-in track (or none) on the TV, instead of any subtitle file sent from the phone.
+                val language = subtitleTracks.firstOrNull { it.index == index }?.language
+                UnifiedCastRepository.updateCastTracks(playbackSnapshot.positionMs) {
+                    it.copy(
+                        subtitleUrl = null,
+                        subtitleHeaders = emptyMap(),
+                        subtitleTrackIndex = index.takeIf { i -> i >= 0 },
+                        subtitleTrackLanguage = language,
+                        builtInSubtitlesOff = index < 0,
+                    )
+                }
             }
         },
         onAddonSubtitleSelected = { addon ->
@@ -786,11 +806,15 @@ private fun PlayerScreenRuntime.RenderPlayerModals(displayedPositionMs: Long) {
                 val addonIdx = addonSubtitles.indexOfFirst { it.selectionKey == addon.selectionKey }
                 val trackId = if (addonIdx >= 0) (externalSubtitles.size + addonIdx + 1).toLong() else null
                 UnifiedCastRepository.setActiveSubtitleTrack(trackId)
-                UnifiedCastRepository.setCastSubtitle(
-                    url = addon.url,
-                    headers = externalSubtitles.firstOrNull { it.url == addon.url }?.headers ?: emptyMap(),
-                    positionMs = playbackSnapshot.positionMs,
-                )
+                val headers = externalSubtitles.firstOrNull { it.url == addon.url }?.headers ?: emptyMap()
+                UnifiedCastRepository.updateCastTracks(playbackSnapshot.positionMs) {
+                    it.copy(
+                        subtitleUrl = addon.url,
+                        subtitleHeaders = headers,
+                        subtitleTrackIndex = null,
+                        builtInSubtitlesOff = true,
+                    )
+                }
             }
         },
         onFetchAddonSubtitles = { fetchAddonSubtitlesForActiveItem() },
