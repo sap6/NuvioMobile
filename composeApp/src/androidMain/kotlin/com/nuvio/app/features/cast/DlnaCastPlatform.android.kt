@@ -70,6 +70,7 @@ internal actual object DlnaCastPlatform {
      * that don't pass multicast. Each device that answers is asked for its description.
      */
     actual suspend fun scanDevices(timeoutMs: Int): DlnaScanResult = withContext(Dispatchers.IO) {
+        CastLog.add("Search started")
         var multicastLock: WifiManager.MulticastLock? = null
         try {
             val network = refreshLocalNetwork()
@@ -104,6 +105,7 @@ internal actual object DlnaCastPlatform {
                     Thread.sleep(5)
                 }
                 Log.i(TAG, "Sent $sent searches (Wi-Fi bound: ${network.canBind}, own address ${network.ownAddress?.hostAddress})")
+                CastLog.add("Sent $sent searches (Wi-Fi bound: ${network.canBind}, VPN: ${appContext?.let { CastLocalNetwork.hasVpn(it) }})")
                 if (sent == 0) {
                     return@withContext DlnaScanResult.Failure(blockedReason())
                 }
@@ -252,6 +254,11 @@ internal actual object DlnaCastPlatform {
         )
         val setUriBody = DlnaSoap.buildSetAvTransportUriBody(uri = url, metadata = didl)
         Log.i(TAG, "SetAVTransportURI to ${device.controlUrl} uri=$url relay=$viaRelay subtitle=$subtitleUrl")
+        CastLog.add(
+            "Send to ${device.friendlyName} (${device.manufacturer ?: "?"} ${device.modelName ?: ""}): " +
+                "${if (viaRelay) "relay" else "direct"} ${CastLog.shortUrl(request.sourceUrl)} as $mime, " +
+                "subtitle ${request.subtitleUrl?.let(CastLog::shortUrl) ?: "none"}, from ${request.startPositionMs / 1000}s",
+        )
         if (!soap(device, "SetAVTransportURI", setUriBody)) {
             // Some TVs refuse a new link while they're still playing; stopping first lets them take it.
             soap(device, "Stop", DlnaSoap.buildStopBody())
@@ -279,6 +286,7 @@ internal actual object DlnaCastPlatform {
             val state = soapResponse(device, "GetTransportInfo", DlnaSoap.buildGetTransportInfoBody())
                 ?.let(DlnaSoap::parseTransportState)
             Log.d(TAG, "Transport state: $state")
+            CastLog.add("TV state: $state")
             when (state) {
                 "PLAYING", "PAUSED_PLAYBACK" -> return true
                 "NO_MEDIA_PRESENT" -> return false
@@ -319,9 +327,18 @@ internal actual object DlnaCastPlatform {
 
     private fun soapResponse(device: DlnaDevice, action: String, body: String): String? = try {
         httpClient.newCall(soapRequest(device.controlUrl, device.avTransportServiceType, action, body)).execute()
-            .use { resp -> if (resp.isSuccessful) resp.body.string() else null }
+            .use { resp ->
+                val text = resp.body.string()
+                if (resp.isSuccessful) {
+                    text
+                } else {
+                    CastLog.add("TV $action -> ${resp.code} (${DlnaSoap.describeFault(text) ?: text.take(120)})")
+                    null
+                }
+            }
     } catch (e: Exception) {
         Log.w(TAG, "$action failed: ${e.message}")
+        CastLog.add("TV $action failed: ${e.javaClass.simpleName} ${e.message}")
         null
     }
 
@@ -333,13 +350,20 @@ internal actual object DlnaCastPlatform {
         url: String = device.controlUrl,
         serviceType: String = device.avTransportServiceType,
     ): Boolean = try {
+        val started = System.currentTimeMillis()
         client.newCall(soapRequest(url, serviceType, action, body)).execute().use { resp ->
             val text = resp.body.string()
+            val took = System.currentTimeMillis() - started
             Log.i(TAG, "$action response ${resp.code}${if (resp.isSuccessful) "" else " body=${text.take(300)}"}")
+            CastLog.add(
+                "TV $action -> ${resp.code} in ${took}ms" +
+                    if (resp.isSuccessful) "" else " (${DlnaSoap.describeFault(text) ?: text.take(120)})",
+            )
             resp.isSuccessful
         }
     } catch (e: Exception) {
         Log.w(TAG, "$action failed: ${e.message}")
+        CastLog.add("TV $action failed: ${e.javaClass.simpleName} ${e.message}")
         false
     }
 
@@ -415,25 +439,44 @@ internal actual object DlnaCastPlatform {
     }
 
     actual suspend fun resumePlayback(device: DlnaDevice): Boolean = withContext(Dispatchers.IO) {
-        commandLock.withLockBlocking { soap(device, "Play", DlnaSoap.buildPlayBody()) }
+        commandLock.withLockBlocking {
+            // Some TVs only answer Play once playback has restarted.
+            soap(device, "Play", DlnaSoap.buildPlayBody(), slowClient)
+        }
     }
 
     /** Null when the TV is busy with a command, so position checks never hold up the controls. */
     actual suspend fun getPositionInfo(device: DlnaDevice): Long? = withContext(Dispatchers.IO) {
         commandLock.ifFree {
             soapResponse(device, "GetPositionInfo", DlnaSoap.buildGetPositionInfoBody())?.let(DlnaSoap::parsePositionInfo)
+                ?.also { position ->
+                    // Log readings that don't follow on from the last one (a seek, a stall, a jump back).
+                    val last = lastLoggedPosition
+                    if (last == null || position < last || position - last > 3_000) {
+                        CastLog.add("TV position ${position / 1000}s")
+                    }
+                    lastLoggedPosition = position
+                }
         }
     }
+
+    @Volatile private var lastLoggedPosition: Long? = null
+    @Volatile private var lastLoggedState: String? = null
 
     actual suspend fun getTransportState(device: DlnaDevice): String? = withContext(Dispatchers.IO) {
         commandLock.ifFree {
             soapResponse(device, "GetTransportInfo", DlnaSoap.buildGetTransportInfoBody())?.let(DlnaSoap::parseTransportState)
+                ?.also { if (it != lastLoggedState) CastLog.add("TV state: $it") }
+                ?.also { lastLoggedState = it }
         }
     }
 
     actual suspend fun seekPlayback(device: DlnaDevice, positionMs: Long): Boolean = withContext(Dispatchers.IO) {
         commandLock.withLockBlocking {
-            soap(device, "Seek", DlnaSoap.buildSeekBody(target = DlnaSoap.formatDurationMs(positionMs)))
+            val target = DlnaSoap.formatDurationMs(positionMs)
+            // Most TVs take REL_TIME; some only ABS_TIME.
+            soap(device, "Seek", DlnaSoap.buildSeekBody(target = target)) ||
+                soap(device, "Seek", DlnaSoap.buildSeekBody(target = target, unit = "ABS_TIME"))
         }
     }
 

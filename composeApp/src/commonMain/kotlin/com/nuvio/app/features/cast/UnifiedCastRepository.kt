@@ -83,6 +83,7 @@ object UnifiedCastRepository {
             val seeks = batch.count { it is RemoteCommand.Seek }
             val playStates = batch.count { it is RemoteCommand.PlayState }
             val dev = currentDevice
+            CastLog.add("Phone: running ${batch.joinToString { it.describe() }}")
             try {
                 if (dev != null) {
                     batch.lastOrNull { it is RemoteCommand.Subtitle }?.let { applySubtitle(dev, it as RemoteCommand.Subtitle) }
@@ -90,7 +91,8 @@ object UnifiedCastRepository {
                     batch.lastOrNull { it is RemoteCommand.PlayState }?.let { applyPlayState(dev, (it as RemoteCommand.PlayState).play) }
                     batch.lastOrNull { it is RemoteCommand.Volume }?.let { applyVolume(dev, (it as RemoteCommand.Volume).fraction) }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                CastLog.add("Phone: command failed: ${e.message}")
             } finally {
                 pendingSeeks.addAndFetch(-seeks)
                 pendingPlayStates.addAndFetch(-playStates)
@@ -137,6 +139,22 @@ object UnifiedCastRepository {
         DlnaCastPlatform.changeSubtitle(device, request, command.positionMs)
         isPaused = false
         positionSettlesAt = TimeSource.Monotonic.markNow() + 1500.milliseconds
+    }
+
+    private fun RemoteCommand.describe(): String = when (this) {
+        is RemoteCommand.PlayState -> if (play) "play" else "pause"
+        is RemoteCommand.Seek -> "seek to ${positionMs / 1000}s"
+        is RemoteCommand.Volume -> "volume ${(fraction * 100).toInt()}"
+        is RemoteCommand.Subtitle -> "subtitle ${url?.let(CastLog::shortUrl) ?: "off"}"
+    }
+
+    /** Forgets queued commands and settling windows, so nothing carries over to the next cast. */
+    private fun resetRemoteState() {
+        while (commands.tryReceive().isSuccess) Unit
+        pendingSeeks.store(0)
+        pendingPlayStates.store(0)
+        positionSettlesAt = null
+        playStateSettlesAt = null
     }
 
     private fun send(command: RemoteCommand) {
@@ -201,8 +219,10 @@ object UnifiedCastRepository {
         castJob = scope.launch {
             try {
                 _state.value = UnifiedCastState.Casting(device, "")
+                resetRemoteState()
                 currentRequest = dlnaRequest
                 isPaused = false
+                CastLog.add("Phone: cast to ${device.name} (${device.protocol})")
                 // Reuse same proxy preparation for both protocols (headers/ torrent)
                 val proxyUrl = withContext(Dispatchers.IO) { DlnaCastPlatform.prepareProxyUrl(dlnaRequest) }
                 currentDevice = device
@@ -278,7 +298,8 @@ object UnifiedCastRepository {
         currentDevice = null
         currentProxyUrl = null
         currentRequest = null
-        while (commands.tryReceive().isSuccess) Unit
+        resetRemoteState()
+        CastLog.add("Phone: stop casting")
         _state.value = UnifiedCastState.Idle
         scope.launch(Dispatchers.IO) {
             try {

@@ -129,12 +129,20 @@ internal class CastRelay(
         val method = parts.getOrNull(0).orEmpty()
         val path = parts.getOrNull(1).orEmpty()
         val out = socket.getOutputStream()
+        val range = headers["range"]
+        val isSubtitle = path.startsWith("/$token/sub")
+        Log.d(TAG, "TV asked: $method $path range=$range")
+        CastLog.add(
+            "Relay: TV $method ${if (isSubtitle) "subtitle" else "video"} range=${range ?: "none"}" +
+                (headers["user-agent"]?.let { " (${it.take(40)})" } ?: ""),
+        )
         if (method != "GET" && method != "HEAD") return out.respond("405 Method Not Allowed")
         if (path.startsWith("/$token/sub$subtitleGeneration/")) return serveSubtitle(method == "HEAD", out)
         val current = source
-        if (current == null || !path.startsWith("/$token/$generation/")) return out.respond("404 Not Found")
-        val range = headers["range"]
-        Log.d(TAG, "TV asked: $method range=$range")
+        if (current == null || !path.startsWith("/$token/$generation/")) {
+            CastLog.add("Relay: 404 for an old or unknown link")
+            return out.respond("404 Not Found")
+        }
         when (current) {
             is Source.LocalFile -> serveFile(current, method == "HEAD", range, out)
             is Source.Remote -> serveRemote(current, method == "HEAD", range, out)

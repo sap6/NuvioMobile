@@ -44,8 +44,15 @@ internal object DlnaSoap {
     fun buildStopBody(instanceId: Int = 0): String =
         """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:Stop xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>$instanceId</InstanceID></u:Stop></s:Body></s:Envelope>"""
 
-    fun buildSeekBody(instanceId: Int = 0, target: String): String =
-        """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:Seek xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>$instanceId</InstanceID><Unit>REL_TIME</Unit><Target>$target</Target></u:Seek></s:Body></s:Envelope>"""
+    fun buildSeekBody(instanceId: Int = 0, target: String, unit: String = "REL_TIME"): String =
+        """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:Seek xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>$instanceId</InstanceID><Unit>$unit</Unit><Target>$target</Target></u:Seek></s:Body></s:Envelope>"""
+
+    /** "error 701 Transition not available" from a UPnP fault, for the cast log. */
+    fun describeFault(xml: String): String? {
+        val code = Regex("<errorCode>([^<]+)</errorCode>").find(xml)?.groupValues?.get(1) ?: return null
+        val description = Regex("<errorDescription>([^<]+)</errorDescription>").find(xml)?.groupValues?.get(1)
+        return "error $code${description?.let { " $it" } ?: ""}"
+    }
 
     fun buildPauseBody(instanceId: Int = 0): String =
         """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:Pause xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>$instanceId</InstanceID></u:Pause></s:Body></s:Envelope>"""

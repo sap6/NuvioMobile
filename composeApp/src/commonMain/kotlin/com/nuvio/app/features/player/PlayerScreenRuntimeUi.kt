@@ -1225,6 +1225,14 @@ private fun PlayerScreenRuntime.RenderCastingOverlay() {
                     style = MaterialTheme.typography.labelSmall,
                     color = Color.White.copy(alpha = 0.6f)
                 )
+                // What the TV was sent and answered, to paste into a bug report.
+                val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+                androidx.compose.material3.TextButton(onClick = {
+                    clipboard.setText(androidx.compose.ui.text.AnnotatedString(com.nuvio.app.features.cast.CastLog.dump()))
+                    showGestureMessage("Cast log copied")
+                }) {
+                    Text("Copy cast log", style = MaterialTheme.typography.labelSmall, color = Color.White.copy(alpha = 0.6f))
+                }
             }
         }
     }
