@@ -73,6 +73,19 @@ object UnifiedCastRepository {
     @Volatile private var positionSettlesAt: TimeMark? = null
     @Volatile private var playStateSettlesAt: TimeMark? = null
 
+    /**
+     * Until this passes, the TV isn't asked anything: slow TVs (LG's take seconds per command) answer
+     * one request at a time, and a status check would hold up the next command.
+     */
+    @Volatile private var quietUntil: TimeMark? = null
+    @Volatile private var reloading = false
+
+    /** True once the TV has stopped by itself (its own Stop button, or the end of the video). */
+    private val _endedOnTv = MutableStateFlow(false)
+    val endedOnTv: StateFlow<Boolean> = _endedOnTv.asStateFlow()
+    private var stoppedReadings = 0
+    private var castStartedAt: TimeMark? = null
+
     init {
         scope.launch { runCommands() }
     }
@@ -95,6 +108,7 @@ object UnifiedCastRepository {
             } catch (e: Exception) {
                 CastLog.add("Phone: command failed: ${e.message}")
             } finally {
+                quietUntil = TimeSource.Monotonic.markNow() + 1500.milliseconds
                 pendingSeeks.addAndFetch(-seeks)
                 pendingPlayStates.addAndFetch(-playStates)
                 if (seeks > 0) positionSettlesAt = TimeSource.Monotonic.markNow() + 1500.milliseconds
@@ -138,11 +152,17 @@ object UnifiedCastRepository {
         if (request == previous) return
         currentRequest = request
         val command = reloads.last()
-        // Sending the video again restarts it; hold position readings until it has caught up.
-        positionSettlesAt = TimeSource.Monotonic.markNow() + 6000.milliseconds
-        DlnaCastPlatform.changeTracks(device, request, command.positionMs)
+        // Sending the video again restarts it; hold readings until it has caught up.
+        reloading = true
+        try {
+            DlnaCastPlatform.changeTracks(device, request, command.positionMs)
+        } finally {
+            reloading = false
+        }
         isPaused = false
-        positionSettlesAt = TimeSource.Monotonic.markNow() + 1500.milliseconds
+        stoppedReadings = 0
+        positionSettlesAt = TimeSource.Monotonic.markNow() + 3000.milliseconds
+        playStateSettlesAt = TimeSource.Monotonic.markNow() + 3000.milliseconds
     }
 
     private fun RemoteCommand.describe(): String = when (this) {
@@ -159,7 +179,15 @@ object UnifiedCastRepository {
         pendingPlayStates.store(0)
         positionSettlesAt = null
         playStateSettlesAt = null
+        quietUntil = null
+        reloading = false
+        stoppedReadings = 0
+        _endedOnTv.value = false
+        castStartedAt = TimeSource.Monotonic.markNow()
     }
+
+    private val isQuiet: Boolean
+        get() = reloading || pendingSeeks.load() > 0 || pendingPlayStates.load() > 0 || quietUntil?.hasNotPassedNow() == true
 
     private fun send(command: RemoteCommand) {
         when (command) {
@@ -335,7 +363,7 @@ object UnifiedCastRepository {
      */
     suspend fun getPosition(): Long? {
         val dev = currentDevice ?: return null
-        if (pendingSeeks.load() > 0 || positionSettlesAt?.hasNotPassedNow() == true) return null
+        if (isQuiet || positionSettlesAt?.hasNotPassedNow() == true) return null
         val position = when (dev.protocol) {
             CastProtocol.DLNA -> dev.dlnaDevice?.let { DlnaCastPlatform.getPositionInfo(it) }
             CastProtocol.CHROMECAST -> ChromecastPlatform.getPosition()
@@ -352,12 +380,23 @@ object UnifiedCastRepository {
      */
     suspend fun getRemotePaused(): Boolean? {
         val dev = currentDevice ?: return null
-        if (pendingPlayStates.load() > 0 || playStateSettlesAt?.hasNotPassedNow() == true) return null
+        if (isQuiet || playStateSettlesAt?.hasNotPassedNow() == true) return null
         val state = when (dev.protocol) {
             CastProtocol.DLNA, CastProtocol.DIAL -> dev.dlnaDevice?.let { DlnaCastPlatform.getTransportState(it) }
             else -> null
         } ?: return null
-        if (pendingPlayStates.load() > 0 || playStateSettlesAt?.hasNotPassedNow() == true) return null
+        if (isQuiet || playStateSettlesAt?.hasNotPassedNow() == true) return null
+        // Stopped twice in a row, well after casting started: the TV was stopped there (or the video
+        // ended), so the phone should stop casting too.
+        if (state == "STOPPED" || state == "NO_MEDIA_PRESENT") {
+            val settled = castStartedAt?.let { it.elapsedNow().inWholeMilliseconds > 15_000 } == true
+            if (settled && ++stoppedReadings >= 2 && !_endedOnTv.value) {
+                CastLog.add("Phone: TV stopped by itself")
+                _endedOnTv.value = true
+            }
+        } else {
+            stoppedReadings = 0
+        }
         return when (state) {
             "PAUSED_PLAYBACK" -> true
             "PLAYING" -> false

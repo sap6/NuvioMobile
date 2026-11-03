@@ -42,6 +42,12 @@ internal class CastRelay(
     sealed interface SubtitleSource {
         data class LocalFile(val file: File) : SubtitleSource
         data class Remote(val url: String, val headers: Map<String, String>) : SubtitleSource
+
+        /** SRT made on the phone, such as a built-in subtitle taken out of a download; [key] tells versions apart. */
+        class Generated(val key: String, val srt: String) : SubtitleSource {
+            override fun equals(other: Any?) = other is Generated && other.key == key
+            override fun hashCode() = key.hashCode()
+        }
     }
 
     private val server = ServerSocket(0, 16, address)
@@ -266,6 +272,7 @@ internal class CastRelay(
 
     private fun loadSubtitle(): ByteArray? {
         val text = when (val current = subtitle ?: return null) {
+            is SubtitleSource.Generated -> current.srt
             is SubtitleSource.LocalFile -> runCatching { current.file.readText() }.getOrNull()
             is SubtitleSource.Remote -> try {
                 val request = Request.Builder().url(current.url)

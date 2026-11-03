@@ -47,6 +47,9 @@ internal object DlnaSoap {
     fun buildSeekBody(instanceId: Int = 0, target: String, unit: String = "REL_TIME"): String =
         """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:Seek xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>$instanceId</InstanceID><Unit>$unit</Unit><Target>$target</Target></u:Seek></s:Body></s:Envelope>"""
 
+    fun faultCode(xml: String): Int? =
+        Regex("<errorCode>\\s*(\\d+)\\s*</errorCode>").find(xml)?.groupValues?.get(1)?.toIntOrNull()
+
     /** "error 701 Transition not available" from a UPnP fault, for the cast log. */
     fun describeFault(xml: String): String? {
         val code = Regex("<errorCode>([^<]+)</errorCode>").find(xml)?.groupValues?.get(1) ?: return null

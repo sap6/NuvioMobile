@@ -991,10 +991,12 @@ private fun PlayerScreenRuntime.RenderCastingOverlay() {
     var scrubRemoteMs by remember { mutableStateOf<Long?>(null) }
     var remoteVolume by remember { mutableStateOf(UnifiedCastRepository.volume) }
 
-    // Poll position from TV every 1s for progress sync
+    // Check the TV every 2s: slow TVs answer one request at a time, so checks are kept sparse and the
+    // clock counts on between them.
     val pollingDeviceId = castingDevice.id
     LaunchedEffect(pollingDeviceId) {
         var tickCount = 0
+        var lastTick = kotlin.time.TimeSource.Monotonic.markNow()
         while (isCasting) {
             try {
                 val pos = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -1007,24 +1009,41 @@ private fun PlayerScreenRuntime.RenderCastingOverlay() {
                         UnifiedCastRepository.getRemotePaused()
                     }?.let { isRemotePaused = it }
                 }
-                if ((pos == null || pos < 0L) && !isRemotePaused && !isScrubbingRemote) {
-                    // No fresh reading (a command is under way): keep the clock moving so it doesn't freeze.
-                    remotePosMs = if (remoteDurationMs > 0) minOf(remotePosMs + 1000, remoteDurationMs) else remotePosMs + 1000
-                }
+                val elapsed = lastTick.elapsedNow().inWholeMilliseconds
+                lastTick = kotlin.time.TimeSource.Monotonic.markNow()
                 if (pos != null && pos >= 0L) {
                     remotePosMs = pos
                     playbackSnapshot = playbackSnapshot.copy(positionMs = pos)
-                    if (tickCount % 5 == 0) {
+                    if (tickCount % 3 == 0) {
                         WatchProgressRepository.upsertPlaybackProgress(
                             session = playbackSession,
                             snapshot = playbackSnapshot,
                             syncRemote = false,
                         )
                     }
+                } else if (!isRemotePaused && !isScrubbingRemote) {
+                    // No fresh reading: keep the clock moving so it doesn't freeze.
+                    val next = remotePosMs + elapsed
+                    remotePosMs = if (remoteDurationMs > 0) minOf(next, remoteDurationMs) else next
                 }
             } catch (_: Exception) {}
-            delay(1000)
+            delay(2000)
         }
+    }
+
+    // Stopped on the TV (its own Stop button, or the end of the video): leave casting on the phone too,
+    // paused where the TV was.
+    val endedOnTv by UnifiedCastRepository.endedOnTv.collectAsState()
+    LaunchedEffect(endedOnTv) {
+        if (!endedOnTv) return@LaunchedEffect
+        val lastPos = remotePosMs
+        playbackSnapshot = playbackSnapshot.copy(positionMs = lastPos)
+        flushWatchProgress()
+        shouldPlay = false
+        playerController?.seekTo(lastPos)
+        showGestureMessage("Casting stopped on the TV")
+        // Last, since leaving casting removes this screen.
+        UnifiedCastRepository.stop()
     }
 
     val stopCastingAndResume: () -> Unit = {

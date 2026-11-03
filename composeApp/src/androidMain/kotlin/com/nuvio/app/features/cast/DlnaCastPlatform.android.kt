@@ -252,7 +252,8 @@ internal actual object DlnaCastPlatform {
         lastVideoUrl = url
         val mime = (if (viaRelay) relay?.videoMimeType else null) ?: request.mimeType.ifBlank { "video/mp4" }
         val subtitleUrl = request.subtitleUrl?.let { relaySubtitle(it, request.subtitleHeaders) }
-        if (request.subtitleUrl == null) relay?.clearSubtitle()
+            ?: builtInSubtitleUrl(request)
+        if (subtitleUrl == null) relay?.clearSubtitle()
         val didl = DlnaSoap.buildDidlMetadata(
             title = request.title.ifBlank { "Nuvio Cast" },
             proxyUrl = url,
@@ -265,7 +266,8 @@ internal actual object DlnaCastPlatform {
         CastLog.add(
             "Send to ${device.friendlyName} (${device.manufacturer ?: "?"} ${device.modelName ?: ""}): " +
                 "${if (viaRelay) "relay" else "direct"} ${CastLog.shortUrl(request.sourceUrl)} as $mime, " +
-                "subtitle ${request.subtitleUrl?.let(CastLog::shortUrl) ?: "none"}, from ${request.startPositionMs / 1000}s",
+                "subtitle ${request.subtitleUrl?.let(CastLog::shortUrl) ?: if (subtitleUrl != null) "built-in #${(request.subtitleTrackIndex ?: 0) + 1} as file" else "none"}, " +
+                "from ${request.startPositionMs / 1000}s",
         )
         if (!soap(device, "SetAVTransportURI", setUriBody)) {
             // Some TVs refuse a new link while they're still playing; stopping first lets them take it.
@@ -331,6 +333,9 @@ internal actual object DlnaCastPlatform {
             .post(body.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType()))
             .header("Content-Type", "text/xml; charset=\"utf-8\"")
             .header("SOAPACTION", "\"$serviceType#$action\"")
+            // TVs' control servers (LG's among them) handle only a few connections at once; an idle
+            // kept-alive connection holds one of them, and new requests then can't get in.
+            .header("Connection", "close")
             .build()
 
     private fun soapResponse(device: DlnaDevice, action: String, body: String): String? = try {
@@ -357,23 +362,40 @@ internal actual object DlnaCastPlatform {
         client: OkHttpClient = httpClient,
         url: String = device.controlUrl,
         serviceType: String = device.avTransportServiceType,
-    ): Boolean = try {
-        val started = System.currentTimeMillis()
-        client.newCall(soapRequest(url, serviceType, action, body)).execute().use { resp ->
-            val text = resp.body.string()
-            val took = System.currentTimeMillis() - started
-            Log.i(TAG, "$action response ${resp.code}${if (resp.isSuccessful) "" else " body=${text.take(300)}"}")
-            CastLog.add(
-                "TV $action -> ${resp.code} in ${took}ms" +
-                    if (resp.isSuccessful) "" else " (${DlnaSoap.describeFault(text) ?: text.take(120)})",
-            )
-            resp.isSuccessful
+        retries: Int = 1,
+    ): Boolean {
+        lastFaultCode = null
+        repeat(retries + 1) { attempt ->
+            try {
+                val started = System.currentTimeMillis()
+                return client.newCall(soapRequest(url, serviceType, action, body)).execute().use { resp ->
+                    val text = resp.body.string()
+                    val took = System.currentTimeMillis() - started
+                    Log.i(TAG, "$action response ${resp.code}${if (resp.isSuccessful) "" else " body=${text.take(300)}"}")
+                    if (!resp.isSuccessful) lastFaultCode = DlnaSoap.faultCode(text)
+                    CastLog.add(
+                        "TV $action -> ${resp.code} in ${took}ms" +
+                            if (resp.isSuccessful) "" else " (${DlnaSoap.describeFault(text) ?: text.take(120)})",
+                    )
+                    resp.isSuccessful
+                }
+            } catch (e: java.net.SocketTimeoutException) {
+                // The TV didn't take the connection (busy): worth one more try. A timed-out reply isn't
+                // retried, since the TV may already have acted on it.
+                val connectFailed = e.message?.contains("connect", ignoreCase = true) == true
+                CastLog.add("TV $action failed: ${e.message}${if (connectFailed && attempt < retries) ", retrying" else ""}")
+                if (!connectFailed) return false
+            } catch (e: Exception) {
+                Log.w(TAG, "$action failed: ${e.message}")
+                CastLog.add("TV $action failed: ${e.javaClass.simpleName} ${e.message}")
+                return false
+            }
         }
-    } catch (e: Exception) {
-        Log.w(TAG, "$action failed: ${e.message}")
-        CastLog.add("TV $action failed: ${e.javaClass.simpleName} ${e.message}")
-        false
+        return false
     }
+
+    /** The UPnP error code of the last refused command, such as 701 (not possible in this state). */
+    @Volatile private var lastFaultCode: Int? = null
 
     private fun ensureRelay(): CastRelay? {
         relay?.let { return it }
@@ -449,6 +471,37 @@ internal actual object DlnaCastPlatform {
         }
         return tracks.indexOfFirst { sameLanguage(it.language, language) }.takeIf { it >= 0 }
             ?: index.takeIf { it in tracks.indices }
+    }
+
+    /** Built-in subtitles taken out of downloads, by file and track, so switching back is instant. */
+    private val extractedSubtitles = object : LinkedHashMap<String, String>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > 6
+    }
+
+    /**
+     * Also sends the chosen built-in subtitle of a download as a subtitle file: some TVs (LG's) ignore
+     * the file's default subtitle but show a subtitle file sent with the video.
+     */
+    private fun builtInSubtitleUrl(request: DlnaCastRequest): String? {
+        if (request.builtInSubtitlesOff) return null
+        val file = localFile(request.sourceUrl) ?: return null
+        if (!file.name.endsWith(".mkv", ignoreCase = true) && !file.name.endsWith(".webm", ignoreCase = true)) return null
+        val tracks = RandomAccessFile(file, "r").use { MkvTrackFlags.readTracks(it) } ?: return null
+        val subtitles = tracks.filter { it.type == MkvTrackFlags.TYPE_SUBTITLE }
+        val index = request.subtitleTrackIndex?.let { matchTrack(subtitles, it, request.subtitleTrackLanguage) } ?: return null
+        val key = "${file.path}#$index#${file.length()}"
+        val srt = synchronized(extractedSubtitles) { extractedSubtitles[key] } ?: run {
+            val started = System.currentTimeMillis()
+            val extracted = RandomAccessFile(file, "r").use { MkvTrackFlags.extractSubtitle(it, index) }
+            CastLog.add(
+                "Subtitle #${index + 1} (${subtitles[index].codecId}): " +
+                    (extracted?.let { "${it.count { c -> c == '\n' } / 4} lines taken out" } ?: "can't be converted (picture-based?)") +
+                    " in ${System.currentTimeMillis() - started}ms",
+            )
+            extracted?.also { synchronized(extractedSubtitles) { extractedSubtitles[key] = it } }
+        } ?: return null
+        val relay = ensureRelay() ?: return null
+        return relay.serveSubtitle(CastRelay.SubtitleSource.Generated(key, srt))
     }
 
     /** Serves a subtitle (a downloaded file or an online one) to the TV as SRT, from the phone. */
@@ -531,10 +584,25 @@ internal actual object DlnaCastPlatform {
 
     actual suspend fun seekPlayback(device: DlnaDevice, positionMs: Long): Boolean = withContext(Dispatchers.IO) {
         commandLock.withLockBlocking {
-            val target = DlnaSoap.formatDurationMs(positionMs)
-            // Most TVs take REL_TIME; some only ABS_TIME.
-            soap(device, "Seek", DlnaSoap.buildSeekBody(target = target)) ||
-                soap(device, "Seek", DlnaSoap.buildSeekBody(target = target, unit = "ABS_TIME"))
+            val body = DlnaSoap.buildSeekBody(target = DlnaSoap.formatDurationMs(positionMs))
+            if (soap(device, "Seek", body)) return@withLockBlocking true
+            when (lastFaultCode) {
+                // "Seek mode not supported": some TVs only take ABS_TIME.
+                710 -> soap(
+                    device,
+                    "Seek",
+                    DlnaSoap.buildSeekBody(target = DlnaSoap.formatDurationMs(positionMs), unit = "ABS_TIME"),
+                )
+                // LG TVs refuse to seek while paused (501/701): play, seek, then pause again.
+                501, 701 -> {
+                    val state = soapResponse(device, "GetTransportInfo", DlnaSoap.buildGetTransportInfoBody())
+                        ?.let(DlnaSoap::parseTransportState)
+                    state == "PAUSED_PLAYBACK" &&
+                        soap(device, "Play", DlnaSoap.buildPlayBody(), slowClient) &&
+                        soap(device, "Seek", body).also { soap(device, "Pause", DlnaSoap.buildPauseBody()) }
+                }
+                else -> false
+            }
         }
     }
 

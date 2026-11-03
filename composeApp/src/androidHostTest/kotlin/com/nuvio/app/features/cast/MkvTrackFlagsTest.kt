@@ -63,6 +63,23 @@ class MkvTrackFlagsTest {
     }
 
     @Test
+    fun extractsATextSubtitleAsSrt() {
+        val srt = RandomAccessFile(source, "r").use { MkvTrackFlags.extractSubtitle(it, subtitleIndex = 1) }
+        assertEquals("1\n00:00:00,000 --> 00:00:01,000\nHola\n\n", srt)
+    }
+
+    @Test
+    fun extractsAssDialogueWithoutStyling() {
+        val file = File("src/androidHostTest/resources/cast/ass.mkv")
+        val srt = RandomAccessFile(file, "r").use { MkvTrackFlags.extractSubtitle(it, subtitleIndex = 0) }
+        assertEquals(
+            "1\n00:00:00,500 --> 00:00:01,500\nBonjour, le monde\nligne deux\n\n" +
+                "2\n00:00:02,000 --> 00:00:03,000\nSecond\n\n",
+            srt,
+        )
+    }
+
+    @Test
     fun rejectsFilesThatArentMatroska() {
         val notMkv = File("build/cast-test/not.mkv").apply { parentFile.mkdirs(); writeText("hello") }
         assertNull(RandomAccessFile(notMkv, "r").use { MkvTrackFlags.readTracks(it) })
